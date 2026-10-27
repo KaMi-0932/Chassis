@@ -127,6 +127,8 @@ class Chassis
     ///< High buffer energy threshold (J)
     float rotor_scale_lpf_alpha = 0.2f;  ///< 动态缩放的一阶低通系数
     ///< First-order low-pass coefficient of the dynamic scale
+    float moment_of_inertia =
+        0.0f;  ///< Helm yaw inertia (kg*m^2); zero disables yaw feedforward.
   };
 
   /**
@@ -239,34 +241,19 @@ class Chassis
                                 .chassis_cmd_topic_name = "chassis_cmd",
                                 .chassis_ref_topic_name = "chassis_ref",
                                 .gimbal_euler_topic_name = "gimbal_euler"})
-      : chassis_(&motor_wheel_0, &motor_wheel_1, &motor_wheel_2, &motor_wheel_3,
-                 motor_steer_0, motor_steer_1, motor_steer_2, motor_steer_3, &cmd,
-                 &power_control, &referee, task_stack_depth,
-                 typename ChassisType::ChassisParam{
-                     .wheel_radius = param.chassis_param.wheel_radius,
-                     .wheel_to_center = param.chassis_param.wheel_to_center,
-                     .gravity_height = param.chassis_param.gravity_height,
-                     .reduction_ratio = param.chassis_param.reduction_ratio,
-                     .wheel_resistance = param.chassis_param.wheel_resistance,
-                     .error_compensation = param.chassis_param.error_compensation,
-                     .gravity = param.chassis_param.gravity,
-                     .length = param.chassis_param.length,
-                     .width = param.chassis_param.width,
-                     .rotor_speed_scale = param.chassis_param.rotor_speed_scale,
-                     .rotor_omega_min_scale = param.chassis_param.rotor_omega_min_scale,
-                     .rotor_buffer_low_j = param.chassis_param.rotor_buffer_low_j,
-                     .rotor_buffer_high_j = param.chassis_param.rotor_buffer_high_j,
-                     .rotor_scale_lpf_alpha = param.chassis_param.rotor_scale_lpf_alpha},
-                 param.pid_follow, param.pid_velocity_x, param.pid_velocity_y,
-                 param.pid_omega, param.pid_wheel_speed_0, param.pid_wheel_speed_1,
-                 param.pid_wheel_speed_2, param.pid_wheel_speed_3,
-                 param.pid_steer_angle_0, param.pid_steer_angle_1,
-                 param.pid_steer_angle_2, param.pid_steer_angle_3,
-                 param.pid_steer_speed_0, param.pid_steer_speed_1,
-                 param.pid_steer_speed_2, param.pid_steer_speed_3, param.thread_priority,
-                 ChassisTopicNames{.chassis_cmd = param.chassis_cmd_topic_name,
-                                   .chassis_ref = param.chassis_ref_topic_name,
-                                   .gimbal_euler = param.gimbal_euler_topic_name}),
+      : chassis_(
+            &motor_wheel_0, &motor_wheel_1, &motor_wheel_2, &motor_wheel_3, motor_steer_0,
+            motor_steer_1, motor_steer_2, motor_steer_3, &cmd, &power_control, &referee,
+            task_stack_depth, MakeChassisParam(param.chassis_param), param.pid_follow,
+            param.pid_velocity_x, param.pid_velocity_y, param.pid_omega,
+            param.pid_wheel_speed_0, param.pid_wheel_speed_1, param.pid_wheel_speed_2,
+            param.pid_wheel_speed_3, param.pid_steer_angle_0, param.pid_steer_angle_1,
+            param.pid_steer_angle_2, param.pid_steer_angle_3, param.pid_steer_speed_0,
+            param.pid_steer_speed_1, param.pid_steer_speed_2, param.pid_steer_speed_3,
+            param.thread_priority,
+            ChassisTopicNames{.chassis_cmd = param.chassis_cmd_topic_name,
+                              .chassis_ref = param.chassis_ref_topic_name,
+                              .gimbal_euler = param.gimbal_euler_topic_name}),
         referee_(&referee)
   {
     auto callback = LibXR::Callback<uint32_t>::Create(
@@ -313,6 +300,30 @@ class Chassis
   void EventHandler(uint32_t event_id) { chassis_.SetMode(event_id); }
 
  private:
+  static typename ChassisType::ChassisParam MakeChassisParam(const ChassisParam& param)
+  {
+    typename ChassisType::ChassisParam result{
+        .wheel_radius = param.wheel_radius,
+        .wheel_to_center = param.wheel_to_center,
+        .gravity_height = param.gravity_height,
+        .reduction_ratio = param.reduction_ratio,
+        .wheel_resistance = param.wheel_resistance,
+        .error_compensation = param.error_compensation,
+        .gravity = param.gravity,
+        .length = param.length,
+        .width = param.width,
+        .rotor_speed_scale = param.rotor_speed_scale,
+        .rotor_omega_min_scale = param.rotor_omega_min_scale,
+        .rotor_buffer_low_j = param.rotor_buffer_low_j,
+        .rotor_buffer_high_j = param.rotor_buffer_high_j,
+        .rotor_scale_lpf_alpha = param.rotor_scale_lpf_alpha};
+    if constexpr (std::is_same_v<ChassisType, Helm>)
+    {
+      result.moment_of_inertia = param.moment_of_inertia;
+    }
+    return result;
+  }
+
   ChassisType chassis_;
   LibXR::Event chassis_event_;
   Referee* referee_;
