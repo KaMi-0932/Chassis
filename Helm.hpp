@@ -32,51 +32,6 @@ depends: []
 
 #define HELM_CHASSIS_MAX_POWER 100
 
-/* 固定 RAM 符号供 Ozone Data Sampling 使用，不参与控制反馈。 */
-extern "C"
-{
-  inline volatile float helm_plot_cmd_x = 0.0f;
-  inline volatile float helm_plot_cmd_y = 0.0f;
-  inline volatile float helm_plot_cmd_z = 0.0f;
-  inline volatile float helm_plot_chassis_mode = 0.0f;
-  inline volatile float helm_plot_target_vy_mps = 0.0f;
-  inline volatile float helm_plot_measured_vy_mps = 0.0f;
-  inline volatile float helm_plot_target_vx_mps = 0.0f;
-  inline volatile float helm_plot_measured_vx_mps = 0.0f;
-  inline volatile float helm_plot_omega_reference_radps = 0.0f;
-  inline volatile float helm_plot_omega_feedback_radps = 0.0f;
-  inline volatile float helm_plot_omega_control_z = 0.0f;
-  inline volatile float helm_plot_feedback_valid = 0.0f;
-  inline volatile float helm_plot_wheel_target_rpm[4] = {};
-  inline volatile float helm_plot_wheel_feedback_rpm[4] = {};
-  inline volatile float helm_plot_wheel_current_cmd_lsb[4] = {};
-  inline volatile float helm_plot_wheel_reverse[4] = {};
-  inline volatile float helm_plot_power_limited = 0.0f;
-  /* 功率模型估算，单位 W；只统计驱动轮，舵向功率显示保持为零。 */
-  inline volatile float helm_plot_power_estimated_w = 0.0f;
-  inline volatile float helm_plot_wheel_power_estimated_w = 0.0f;
-  inline volatile float helm_plot_steer_power_estimated_w = 0.0f;
-  inline volatile float helm_plot_power_requested_w = 0.0f;
-  inline volatile float helm_plot_power_output_estimated_w = 0.0f;
-  inline volatile float helm_plot_power_estimate_valid = 0.0f;
-  inline volatile float helm_plot_target_ax_mps2 = 0.0f;
-  inline volatile float helm_plot_target_ay_mps2 = 0.0f;
-  inline volatile float helm_plot_target_alpha_radps2 = 0.0f;
-  inline volatile float helm_plot_wheel_torque_ff_nm[4] = {};
-  /* 力控版专用标量，便于排除数组采样地址和两份 ELF 混用的问题。 */
-  inline volatile float helm_force_plot_wheel0_rpm = 0.0f;
-  inline volatile float helm_force_plot_wheel1_rpm = 0.0f;
-  inline volatile float helm_force_plot_wheel2_rpm = 0.0f;
-  inline volatile float helm_force_plot_wheel3_rpm = 0.0f;
-  inline volatile float helm_force_plot_wheel1_angle_rad = 0.0f;
-  inline volatile float helm_force_plot_wheel1_update_ok = 0.0f;
-  inline volatile float helm_force_plot_wheel1_torque_ff_nm = 0.0f;
-  /* pid_nm 是 PID 计算结果；仅前馈输出时它不会被加入最终力矩。 */
-  inline volatile float helm_force_plot_wheel1_pid_nm = 0.0f;
-  inline volatile float helm_force_plot_wheel1_torque_cmd_nm = 0.0f;
-  inline volatile float helm_force_plot_wheel1_steer_error_rad = 0.0f;
-  inline volatile uint32_t helm_force_plot_cycle_count = 0U;
-}
 struct ChassisVelocity
 {
   float x = 0.0f;      // m/s, +x right
@@ -84,65 +39,135 @@ struct ChassisVelocity
   float omega = 0.0f;  // rad/s, counterclockwise positive
   bool valid = false;
 };
-static ChassisVelocity* HOOK_;
 
 template <typename ChassisType>
 class Chassis;
+
+/**
+ * @brief 舵轮底盘控制实现，由 Chassis 模板使用。
+ *        Helm (swerve) chassis controller used by the Chassis template.
+ */
 class Helm
 {
  public:
+  /**
+   * @brief 底盘几何、动力与小陀螺缩放参数。
+   *        Chassis geometry, dynamics and spin-scaling parameters.
+   */
   struct ChassisParam
   {
-    float wheel_radius = 0.0f;
-    float wheel_to_center = 0.0f;
-    float gravity_height = 0.0f;
-    float reduction_ratio = 0.0f;
-    float wheel_resistance = 0.0f;
-    float error_compensation = 0.0f;
-    float gravity = 0.0f;
-    float length = 0.0f;
-    float width = 0.0f;
-    float rotor_speed_scale = 1.0f;      /* 平移输入下的小陀螺缩放 */
-    float rotor_omega_min_scale = 0.55f; /* 动态缩放下限 */
-    float rotor_buffer_low_j = 35.0f;    /* 缓冲能量低阈值 */
-    float rotor_buffer_high_j = 70.0f;   /* 缓冲能量高阈值 */
-    float rotor_scale_lpf_alpha = 0.2f;  /* 动态缩放低通系数 */
-    /* 绕底盘中心竖直轴的转动惯量 kg*m^2；0 表示停用旋转力矩前馈。 */
-    float moment_of_inertia = 0.0f;
+    float wheel_radius = 0.0f;  ///< 轮半径 (m)
+    ///< Wheel radius (m)
+    float wheel_to_center = 0.0f;  ///< 轮心到底盘中心的距离 (m)
+    ///< Distance from the wheel center to the chassis center (m)
+    float gravity_height = 0.0f;  ///< 质心高度 (m)，用于全向轮姿态前馈
+    ///< Center-of-mass height (m), used by the Omni attitude feedforward
+    float reduction_ratio = 0.0f;  ///< 轮电机减速比
+    ///< Reduction ratio of the wheel motors
+    float wheel_resistance = 0.0f;  ///< 轮阻
+    ///< Wheel resistance
+    float error_compensation = 0.0f;  ///< 误差补偿
+    ///< Error compensation
+    float gravity = 0.0f;  ///< 底盘重力 (N)，用于全向轮姿态前馈
+    ///< Chassis weight (N), used by the Omni attitude feedforward
+    float length = 0.0f;  ///< 轮距的长 (m)，用于全向轮姿态前馈
+    ///< Length of the wheel layout (m), used by the Omni attitude feedforward
+    float width = 0.0f;  ///< 轮距的宽 (m)，用于全向轮姿态前馈
+    ///< Width of the wheel layout (m), used by the Omni attitude feedforward
+    float rotor_speed_scale = 1.0f;  ///< 平移输入下的小陀螺转速缩放比例
+    ///< Spin speed scale under translation input
+    float rotor_omega_min_scale = 0.55f;  ///< 小陀螺动态缩放的下限
+    ///< Lower bound of the dynamic spin scale
+    float rotor_buffer_low_j = 35.0f;  ///< 缓冲能量低阈值 (J)
+    ///< Low buffer energy threshold (J)
+    float rotor_buffer_high_j = 70.0f;  ///< 缓冲能量高阈值 (J)
+    ///< High buffer energy threshold (J)
+    float rotor_scale_lpf_alpha = 0.2f;  ///< 动态缩放的一阶低通系数
+    ///< First-order low-pass coefficient of the dynamic scale
+    float moment_of_inertia = 0.0f;  ///< Yaw inertia (kg*m^2), zero disables feedforward
   };
+  /**
+   * @brief 底盘模式。
+   *        Chassis modes.
+   */
   enum class ChassisMode : uint8_t
   {
-    RELAX,
-    INDEPENDENT,
-    ROTOR,
-    FOLLOW,
+    RELAX,  ///< 放松：全部电机放松
+    ///< Relax: all motors relaxed
+    INDEPENDENT,  ///< 独立：平移相对底盘坐标系
+    ///< Independent: translation in the chassis frame
+    ROTOR,  ///< 小陀螺：底盘旋转，平移相对云台坐标系
+    ///< Spin: the chassis rotates, translation in the gimbal frame
+    FOLLOW  ///< 跟随：底盘跟随云台 yaw，平移相对云台坐标系
+    ///< Follow: the chassis follows the gimbal yaw, translation in the gimbal frame
   };
 
   /**
-   * @brief 构造函数，初始化舵轮底盘控制对象
-   * @param cmd 控制命令引用
-   * @param motor_wheel_0 第0个驱动轮电机指针
-   * @param motor_wheel_1 第1个驱动轮电机指针
-   * @param motor_wheel_2 第2个驱动轮电机指针
-   * @param motor_wheel_3 第3个驱动轮电机指针
-   * @param motor_steer_0 第0个舵向电机指针
-   * @param motor_steer_1 第1个舵向电机指针
-   * @param motor_steer_2 第2个舵向电机指针
-   * @param motor_steer_3 第3个舵向电机指针
-   * @param task_stack_depth 控制线程栈深度
-   * @param chassis_param 舵轮底盘参数，包含重力 N 和转动惯量 kg*m^2
-   * @param pid_follow 跟随云台角度PID参数
-   * @param pid_velocity_x X方向速度PID参数
-   * @param pid_velocity_y Y方向速度PID参数
-   * @param pid_omega 角速度PID参数
-   * @param pid_wheel_speed_0 轮子0速度PID参数
-   * @param pid_wheel_speed_1 轮子1速度PID参数
-   * @param pid_wheel_speed_2 轮子2速度PID参数
-   * @param pid_wheel_speed_3 轮子3速度PID参数
-   * @param pid_steer_angle_0 舵机0角度PID参数
-   * @param pid_steer_angle_1 舵机1角度PID参数
-   * @param pid_steer_angle_2 舵机2角度PID参数
-   * @param pid_steer_angle_3 舵机3角度PID参数
+   * @brief 构造舵轮底盘控制对象，创建控制线程。
+   *        Construct the helm chassis controller and create the control thread.
+   *
+   * @param motor_wheel_0 第 0 个驱动轮电机。
+   *                      Drive wheel motor 0.
+   * @param motor_wheel_1 第 1 个驱动轮电机。
+   *                      Drive wheel motor 1.
+   * @param motor_wheel_2 第 2 个驱动轮电机。
+   *                      Drive wheel motor 2.
+   * @param motor_wheel_3 第 3 个驱动轮电机。
+   *                      Drive wheel motor 3.
+   * @param motor_steer_0 第 0 个舵向电机，非空。
+   *                      Steering motor 0, non-null.
+   * @param motor_steer_1 第 1 个舵向电机，非空。
+   *                      Steering motor 1, non-null.
+   * @param motor_steer_2 第 2 个舵向电机，非空。
+   *                      Steering motor 2, non-null.
+   * @param motor_steer_3 第 3 个舵向电机，非空。
+   *                      Steering motor 3, non-null.
+   * @param cmd 控制命令模块实例。
+   *            Control command Module instance.
+   * @param power_control 功率控制模块实例。
+   *                      Power control Module instance.
+   * @param referee 裁判系统模块实例。
+   *                Referee Module instance.
+   * @param task_stack_depth 控制线程栈深。
+   *                         Control thread stack depth.
+   * @param chassis_param 底盘几何与动力参数。
+   *                      Chassis geometry and dynamics parameters.
+   * @param pid_follow 跟随云台的角度 PID 参数。
+   *                   PID parameters of the gimbal-following angle loop.
+   * @param pid_velocity_x x 方向速度 PID 参数。
+   *                       PID parameters of the x velocity loop.
+   * @param pid_velocity_y y 方向速度 PID 参数。
+   *                       PID parameters of the y velocity loop.
+   * @param pid_omega 角速度 PID 参数。
+   *                  PID parameters of the angular-velocity loop.
+   * @param pid_wheel_speed_0 轮 0 速度 PID 参数。
+   *                          PID parameters of the speed loop of wheel 0.
+   * @param pid_wheel_speed_1 轮 1 速度 PID 参数。
+   *                          PID parameters of the speed loop of wheel 1.
+   * @param pid_wheel_speed_2 轮 2 速度 PID 参数。
+   *                          PID parameters of the speed loop of wheel 2.
+   * @param pid_wheel_speed_3 轮 3 速度 PID 参数。
+   *                          PID parameters of the speed loop of wheel 3.
+   * @param pid_steer_angle_0 舵 0 角度 PID 参数。
+   *                          PID parameters of the angle loop of steering motor 0.
+   * @param pid_steer_angle_1 舵 1 角度 PID 参数。
+   *                          PID parameters of the angle loop of steering motor 1.
+   * @param pid_steer_angle_2 舵 2 角度 PID 参数。
+   *                          PID parameters of the angle loop of steering motor 2.
+   * @param pid_steer_angle_3 舵 3 角度 PID 参数。
+   *                          PID parameters of the angle loop of steering motor 3.
+   * @param pid_steer_speed_0 舵 0 速度 PID 参数。
+   *                          PID parameters of the speed loop of steering motor 0.
+   * @param pid_steer_speed_1 舵 1 速度 PID 参数。
+   *                          PID parameters of the speed loop of steering motor 1.
+   * @param pid_steer_speed_2 舵 2 速度 PID 参数。
+   *                          PID parameters of the speed loop of steering motor 2.
+   * @param pid_steer_speed_3 舵 3 速度 PID 参数。
+   *                          PID parameters of the speed loop of steering motor 3.
+   * @param thread_priority 控制线程优先级。
+   *                        Control thread priority.
+   * @param topic_names 订阅的 Topic 名称。
+   *                    Names of the subscribed Topics.
    */
   Helm(Motor* motor_wheel_0, Motor* motor_wheel_1, Motor* motor_wheel_2,
        Motor* motor_wheel_3, Motor* motor_steer_0, Motor* motor_steer_1,
@@ -220,14 +245,27 @@ class Helm
 
     thread_.Create(this, ThreadFunction, "HelmChassisThread", task_stack_depth,
                    thread_priority);
+    auto start_ctrl_callback = LibXR::Callback<uint32_t>::Create(
+        [](bool in_isr, Helm* helm, uint32_t event_id)
+        {
+          UNUSED(in_isr);
+          UNUSED(event_id);
+          helm->mutex_.Lock();
+          helm->chassis_event_ = ChassisMode::RELAX;
+          helm->mutex_.Unlock();
+        },
+        this);
     auto lost_ctrl_callback = LibXR::Callback<uint32_t>::Create(
         [](bool in_isr, Helm* helm, uint32_t event_id)
         {
           UNUSED(in_isr);
           UNUSED(event_id);
-          helm->LostCtrl();
+          helm->mutex_.Lock();
+          helm->chassis_event_ = ChassisMode::RELAX;
+          helm->mutex_.Unlock();
         },
         this);
+    cmd_->GetEvent().Register(CMD::CMD_EVENT_START_CTRL, start_ctrl_callback);
     cmd_->GetEvent().Register(CMD::CMD_EVENT_LOST_CTRL, lost_ctrl_callback);
   }
 
@@ -309,11 +347,6 @@ class Helm
       const auto STEER_STATUS = motor_steer_[i]->Update();
       motor_wheel_feedback_[i] = motor_wheel_[i]->GetFeedback();
       motor_steer_feedback_[i] = motor_steer_[i]->GetFeedback();
-      if (i == 1)
-      {
-        helm_force_plot_wheel1_update_ok =
-            WHEEL_STATUS == LibXR::ErrorCode::OK ? 1.0f : 0.0f;
-      }
       feedback_valid_ = feedback_valid_ && WHEEL_STATUS == LibXR::ErrorCode::OK &&
                         STEER_STATUS == LibXR::ErrorCode::OK &&
                         motor_wheel_feedback_[i].state != 0 &&
@@ -371,7 +404,7 @@ class Helm
         break;
       case ChassisMode::INDEPENDENT:
       case ChassisMode::ROTOR:
-        target_omega_ = cmd_data_.z * MAX_CHASSIS_OMEGA;
+        target_omega_ = 0.5 * MAX_CHASSIS_OMEGA;
         break;
       case ChassisMode::FOLLOW:
         target_omega_ =
@@ -381,8 +414,6 @@ class Helm
         target_omega_ = 0.0f;
         break;
     }
-    /* 记录角速度期望，便于与正解算反馈对比。 */
-    helm_plot_omega_reference_radps = target_omega_;
 
     /* 再生成目标平移速度，保持原有云台坐标变换。 */
     switch (chassis_event_)
@@ -420,36 +451,19 @@ class Helm
    */
   void PowerControlUpdate()
   {
+    /* 仅提交驱动轮数据；PowerControl 的 motor_count_6020 配置为 0。 */
     for (int i = 0; i < 4; i++)
     {
       motor_data_.rotorspeed_rpm_3508[i] = motor_wheel_feedback_[i].velocity;
-      motor_data_.output_current_3508[i] = motor_wheel_feedback_[i].torque *
-                                           M3508_NM_TO_LSB_RATIO *
-                                           motor_wheel_[i]->GetFeedbackTorquePolarity();
-
-      motor_data_.rotorspeed_rpm_6020[i] = motor_steer_feedback_[i].velocity;
-      motor_data_.output_current_6020[i] =
-          motor_steer_feedback_[i].torque * GM6020_NM_TO_LSB_RATIO;
+      motor_data_.output_current_3508[i] =
+          motor_wheel_feedback_[i].torque * M3508_NM_TO_LSB_RATIO;
     }
 
     /* 第一次设置: 反馈数据用于 RLS 参数估计 */
     power_control_->SetMotorData3508(motor_data_.output_current_3508,
                                      motor_data_.rotorspeed_rpm_3508);
 
-    power_control_->SetMotorData6020(motor_data_.output_current_6020,
-                                     motor_data_.rotorspeed_rpm_6020);
-
     power_control_->CalculatePowerControlParam();
-
-    /* 估算功率时将反馈力矩转换到反馈转速的正方向。 */
-    const auto FEEDBACK_POWER =
-        feedback_valid_ ? power_control_->EstimatePower(motor_data_.output_current_3508,
-                                                        motor_data_.rotorspeed_rpm_3508)
-                        : PowerControl::PowerEstimate{};
-    helm_plot_power_estimated_w = FEEDBACK_POWER.wheel_power_w;
-    helm_plot_wheel_power_estimated_w = FEEDBACK_POWER.wheel_power_w;
-    helm_plot_steer_power_estimated_w = FEEDBACK_POWER.steer_power_w;
-    helm_plot_power_estimate_valid = FEEDBACK_POWER.valid ? 1.0f : 0.0f;
 
     /* 计算 3508 速度跟踪误差 */
     float speed_error_3508[4];
@@ -457,28 +471,15 @@ class Helm
     {
       float actual_speed = motor_reverse_[i] ? -motor_wheel_feedback_[i].velocity
                                              : motor_wheel_feedback_[i].velocity;
-      speed_error_3508[i] = target_motor_rpm_[i] - actual_speed;
+      speed_error_3508[i] = target_speed_[i] - actual_speed;
 
       motor_data_.output_current_3508[i] =
           std::clamp(wheel_out_[i] * M3508_NM_TO_LSB_RATIO / PARAM.reduction_ratio,
                      -16384.0f, 16384.0f);
-      motor_data_.output_current_6020[i] =
-          std::clamp(steer_out_[i] * GM6020_NM_TO_LSB_RATIO, -16384.0f, 16384.0f);
-    }
-
-    /* 计算 6020 舵向速度跟踪误差 */
-    float speed_error_6020[4];
-    for (int i = 0; i < 4; i++)
-    {
-      speed_error_6020[i] = steer_angle_[i] - motor_steer_feedback_[i].velocity *
-                                                  static_cast<float>(LibXR::TWO_PI) /
-                                                  60.0f;
     }
 
     power_control_->SetMotorData3508(motor_data_.output_current_3508,
                                      motor_data_.rotorspeed_rpm_3508, speed_error_3508);
-    power_control_->SetMotorData6020(motor_data_.output_current_6020,
-                                     motor_data_.rotorspeed_rpm_6020, speed_error_6020);
 
     auto now_ms = LibXR::Timebase::GetMilliseconds();
     bool referee_online = (now_ms - referee_last_rx_time_).ToSecondf() <= 1.0f;
@@ -507,12 +508,6 @@ class Helm
         max_power += 40.0f;
       }
     }
-
-    const auto REQUESTED_POWER =
-        feedback_valid_ ? power_control_->EstimatePower(motor_data_.output_current_3508,
-                                                        motor_data_.rotorspeed_rpm_3508)
-                        : PowerControl::PowerEstimate{};
-    helm_plot_power_requested_w = REQUESTED_POWER.wheel_power_w;
 
     power_control_->OutputLimit(max_power);
     power_control_data_ = power_control_->GetPowerControlData();
@@ -632,8 +627,8 @@ class Helm
     {
       for (int i = 0; i < 4; i++)
       {
-        target_motor_rpm_[i] = 0.0f;
-        target_steer_angle_[i] = 0.0f;
+        target_speed_[i] = 0.0f;
+        target_angle_[i] = 0.0f;
         steer_angle_held_[i] = false;
       }
       return;
@@ -644,8 +639,8 @@ class Helm
       case (ChassisMode::RELAX):
         for (int i = 0; i < 4; i++)
         {
-          target_motor_rpm_[i] = 0.0f;
-          target_steer_angle_[i] = 0.0f;
+          target_speed_[i] = 0.0f;
+          target_angle_[i] = 0.0f;
           steer_angle_held_[i] = false;
         }
         break;
@@ -666,20 +661,19 @@ class Helm
             /* 仅轮速度近零时锁存舵角，避免零向量的目标舵角无定义。 */
             if (!steer_angle_held_[i])
             {
-              target_steer_angle_[i] =
+              target_angle_[i] =
                   LibXR::CycleValue<float>(motor_steer_feedback_[i].abs_angle - zero_[i]);
               steer_angle_held_[i] = true;
             }
-            target_motor_rpm_[i] = 0.0f;
+            target_speed_[i] = 0.0f;
           }
           else
           {
             steer_angle_held_[i] = false;
             /* 沿用原有舵角零位：+y 为 0，正角朝 +x。 */
-            target_steer_angle_[i] =
-                static_cast<float>(M_PI_2) - atan2f(WHEEL_VY, WHEEL_VX);
-            target_motor_rpm_[i] = WHEEL_VECTOR_SPEED * MOTOR_RPM_PER_MPS;
-            max_target_speed = fmaxf(max_target_speed, target_motor_rpm_[i]);
+            target_angle_[i] = static_cast<float>(M_PI_2) - atan2f(WHEEL_VY, WHEEL_VX);
+            target_speed_[i] = WHEEL_VECTOR_SPEED * MOTOR_RPM_PER_MPS;
+            max_target_speed = fmaxf(max_target_speed, target_speed_[i]);
           }
         }
         /* 按最大轮速同比例缩放，保留四轮速度比例并限制至 RPM 上限。 */
@@ -688,7 +682,7 @@ class Helm
           const float SPEED_SCALE = motor_max_speed_ / max_target_speed;
           for (int i = 0; i < 4; i++)
           {
-            target_motor_rpm_[i] *= SPEED_SCALE;
+            target_speed_[i] *= SPEED_SCALE;
           }
         }
       }
@@ -696,8 +690,8 @@ class Helm
       default:
         for (int i = 0; i < 4; i++)
         {
-          target_motor_rpm_[i] = 0.0f;
-          target_steer_angle_[i] = 0.0f;
+          target_speed_[i] = 0.0f;
+          target_angle_[i] = 0.0f;
           steer_angle_held_[i] = false;
         }
         break;
@@ -719,7 +713,7 @@ class Helm
         continue;
       }
       if (fabs(LibXR::CycleValue(motor_steer_feedback_[i].abs_angle - zero_[i]) -
-               target_steer_angle_[i]) > M_PI_2)
+               target_angle_[i]) > M_PI_2)
       {
         motor_reverse_[i] = true;
       }
@@ -741,10 +735,10 @@ class Helm
       const LibXR::CycleValue<float> CURRENT_ANGLE(motor_steer_feedback_[i].abs_angle -
                                                    zero_[i]);
       const LibXR::CycleValue<float> OPTIMAL_ANGLE(
-          target_steer_angle_[i] + (motor_reverse_[i] ? static_cast<float>(M_PI) : 0.0f));
+          target_angle_[i] + (motor_reverse_[i] ? static_cast<float>(M_PI) : 0.0f));
       const float STEER_ERROR = OPTIMAL_ANGLE - CURRENT_ANGLE;
       const float ALIGNMENT = fmaxf(0.0f, cosf(STEER_ERROR));
-      target_motor_rpm_[i] *= ALIGNMENT * ALIGNMENT * ALIGNMENT;
+      target_speed_[i] *= ALIGNMENT * ALIGNMENT * ALIGNMENT;
     }
   }
 
@@ -783,14 +777,10 @@ class Helm
       }
       wheel_out_[i] = pid_wheel_speed_[i].Calculate(
           observed_motor_rpm, motor_wheel_feedback_[i].velocity, dt_);
-      if (i == 1)
-      {
-        helm_force_plot_wheel1_pid_nm = wheel_out_[i];
-      }
       if (motor_reverse_[i])
       {
         steer_angle_[i] = pid_steer_angle_[i].Calculate(
-            LibXR::CycleValue<float>(target_steer_angle_[i] + static_cast<float>(M_PI) +
+            LibXR::CycleValue<float>(target_angle_[i] + static_cast<float>(M_PI) +
                                      zero_[i]),
             motor_steer_feedback_[i].abs_angle, dt_);
         steer_out_[i] = pid_steer_speed_[i].Calculate(
@@ -801,7 +791,7 @@ class Helm
       else
       {
         steer_angle_[i] = pid_steer_angle_[i].Calculate(
-            target_steer_angle_[i] + zero_[i], motor_steer_feedback_[i].abs_angle, dt_);
+            target_angle_[i] + zero_[i], motor_steer_feedback_[i].abs_angle, dt_);
         steer_out_[i] = pid_steer_speed_[i].Calculate(
             steer_angle_[i],
             motor_steer_feedback_[i].velocity * static_cast<float>(LibXR::TWO_PI) / 60.0f,
@@ -820,7 +810,7 @@ class Helm
   {
     if (power_control_data_.is_power_limited)
     {
-      /* 只替换驱动轮输出，舵向力矩仍使用舵向 PID 的结果。 */
+      /* 功率限制只替换驱动轮输出，舵向保留 PID 输出和自身扭矩限幅。 */
       for (int i = 0; i < 4; i++)
       {
         wheel_out_[i] = std::clamp(power_control_data_.new_output_current_3508[i] /
@@ -846,73 +836,6 @@ class Helm
         motor_steer_[i]->Control(motor_steer_cmd_[i]);
       }
     }
-
-    /* 按最终力矩限幅和 RELAX 状态，估算下发电流对应的功率。 */
-    MotorData output_motor_data{};
-    for (int i = 0; i < 4; i++)
-    {
-      output_motor_data.rotorspeed_rpm_3508[i] = motor_wheel_feedback_[i].velocity;
-      output_motor_data.rotorspeed_rpm_6020[i] = motor_steer_feedback_[i].velocity;
-      if (chassis_event_ != ChassisMode::RELAX && PARAM.reduction_ratio > 1.0e-6f)
-      {
-        output_motor_data.output_current_3508[i] = std::clamp(
-            motor_wheel_cmd_[i].torque * M3508_NM_TO_LSB_RATIO / PARAM.reduction_ratio,
-            -16384.0f, 16384.0f);
-        output_motor_data.output_current_6020[i] = std::clamp(
-            motor_steer_cmd_[i].torque * GM6020_NM_TO_LSB_RATIO, -16384.0f, 16384.0f);
-      }
-    }
-    const auto OUTPUT_POWER = feedback_valid_ ? power_control_->EstimatePower(
-                                                    output_motor_data.output_current_3508,
-                                                    output_motor_data.rotorspeed_rpm_3508)
-                                              : PowerControl::PowerEstimate{};
-    helm_plot_power_output_estimated_w = OUTPUT_POWER.wheel_power_w;
-
-    helm_plot_cmd_x = cmd_data_.x;
-    helm_plot_cmd_y = cmd_data_.y;
-    helm_plot_cmd_z = cmd_data_.z;
-    helm_plot_chassis_mode = static_cast<float>(static_cast<uint8_t>(chassis_event_));
-    helm_plot_target_vy_mps = target_vy_;
-    helm_plot_measured_vy_mps = measured_chassis_velocity_.y;
-    helm_plot_target_vx_mps = target_vx_;
-    helm_plot_measured_vx_mps = measured_chassis_velocity_.x;
-    helm_plot_omega_feedback_radps = measured_chassis_velocity_.omega;
-    const float MAX_CHASSIS_OMEGA = GetMaxChassisOmega();
-    helm_plot_omega_control_z =
-        MAX_CHASSIS_OMEGA > 1.0e-6f ? target_omega_ / MAX_CHASSIS_OMEGA : 0.0f;
-    helm_plot_feedback_valid = measured_chassis_velocity_.valid ? 1.0f : 0.0f;
-    helm_plot_target_ax_mps2 = target_ax_;
-    helm_plot_target_ay_mps2 = target_ay_;
-    helm_plot_target_alpha_radps2 = target_alpha_;
-    helm_plot_power_limited = power_control_data_.is_power_limited ? 1.0f : 0.0f;
-    for (int i = 0; i < 4; i++)
-    {
-      helm_plot_wheel_target_rpm[i] =
-          motor_reverse_[i] ? -target_motor_rpm_[i] : target_motor_rpm_[i];
-      helm_plot_wheel_feedback_rpm[i] = motor_wheel_feedback_[i].velocity;
-      helm_plot_wheel_reverse[i] = motor_reverse_[i] ? 1.0f : 0.0f;
-      helm_plot_wheel_torque_ff_nm[i] = target_motor_torque_ff_[i];
-      helm_plot_wheel_current_cmd_lsb[i] =
-          chassis_event_ == ChassisMode::RELAX || PARAM.reduction_ratio <= 1.0e-6f
-              ? 0.0f
-              : std::clamp(motor_wheel_cmd_[i].torque * M3508_NM_TO_LSB_RATIO /
-                               PARAM.reduction_ratio,
-                           -16384.0f, 16384.0f);
-    }
-    helm_force_plot_wheel0_rpm = motor_wheel_feedback_[0].velocity;
-    helm_force_plot_wheel1_rpm = motor_wheel_feedback_[1].velocity;
-    helm_force_plot_wheel2_rpm = motor_wheel_feedback_[2].velocity;
-    helm_force_plot_wheel3_rpm = motor_wheel_feedback_[3].velocity;
-    helm_force_plot_wheel1_angle_rad = motor_wheel_feedback_[1].position;
-    helm_force_plot_wheel1_torque_ff_nm = target_motor_torque_ff_[1];
-    helm_force_plot_wheel1_torque_cmd_nm =
-        chassis_event_ == ChassisMode::RELAX ? 0.0f : motor_wheel_cmd_[1].torque;
-    const LibXR::CycleValue<float> WHEEL1_TARGET_ANGLE(
-        target_steer_angle_[1] + (motor_reverse_[1] ? static_cast<float>(M_PI) : 0.0f));
-    const LibXR::CycleValue<float> WHEEL1_CURRENT_ANGLE(
-        motor_steer_feedback_[1].abs_angle - zero_[1]);
-    helm_force_plot_wheel1_steer_error_rad = WHEEL1_TARGET_ANGLE - WHEEL1_CURRENT_ANGLE;
-    helm_force_plot_cycle_count = helm_force_plot_cycle_count + 1U;
   }
 
  private:
@@ -1014,7 +937,6 @@ class Helm
     {
       measured_chassis_velocity_ = {};
     }
-    HOOK_ = &measured_chassis_velocity_;
   }
 
   ChassisVelocity measured_chassis_velocity_{};
@@ -1033,8 +955,8 @@ class Helm
   float delta_yaw_ = 0.0f;
 
   /* 驱动电机转子目标转速 RPM，舵角以 +y 为零位、单位 rad。 */
-  float target_motor_rpm_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  LibXR::CycleValue<float> target_steer_angle_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float target_speed_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  LibXR::CycleValue<float> target_angle_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   bool steer_angle_held_[4] = {false, false, false, false};
 
   /* 输出的电流值 */
@@ -1043,8 +965,6 @@ class Helm
   float steer_angle_[4] = {0.0, 0.0, 0.0, 0.0};
 
   float motor_max_speed_ = 9000.0;
-
-  LibXR::CycleValue<float> main_direct_ = 0.0f;
 
   float dt_ = 0;
   LibXR::MicrosecondTimestamp last_online_time_ = 0;

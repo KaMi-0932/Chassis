@@ -21,30 +21,35 @@ only BlinkLED and is not the product configuration used for this migration.
   reversal, cos-cubed speed compensation, chassis-velocity feedback, and wheel
   torque feedforward are retained. Wheel-speed PID uses observed chassis velocity
   projected along each actual steering direction, matching the source.
-- The left switch selects RELAX / FOLLOW / INDEPENDENT from top to bottom. The
-  right switch selects gimbal RELAX / COMMON / COMMON, matching the source.
+- The current default configuration selects RELAX / FOLLOW / ROTOR from top to
+  bottom on the left switch. The right switch selects gimbal RELAX / COMMON / COMMON.
 - Existing hardware registrations, CAN receive/transport implementation, other
   module constructor interfaces, and configurable Topic names are retained.
 
-## Drive-only power policy
+## Upstream power policy
 
-Only the four M3508 drive motors enter the model estimate and Helm power budget.
-The default product sets `motor_count_6020` to zero. The shared Helm limiter also
-passes steering requests through for configurations that still register 6020s;
-steering retains its local PID and +/-2.5 N*m output clamp.
+PowerControl is restored to QDU-Robomaster/PowerControl at upstream commit
+`4097e1f6a3fad89126e82b920217961286966d84`. The Helm power-data submission, RLS
+invocation and referee/boost budget selection follow
+QDU-Robomaster/Chassis commit `32761d015294031f3d5ac8326b1a394c796302a9`.
 
-The drive budget is the referee/boost limit minus the 4 W control margin. Steering
-and static board losses are not charged against this budget. RLS uses the measured
-power minus configured static loss to identify drive losses; this assumes that
-the measured power supplied by SuperPower covers the drive branch. Check the
-actual power-meter wiring before relying on online identification.
+Only the four M3508 drive motors enter power limiting. The Helm configurations
+set `motor_count_6020` to zero, and Helm submits only M3508 data to PowerControl.
+Limited output currents replace only drive-wheel torque requests; steering keeps
+its PID output and local +/-2.5 N*m torque clamp. The upstream limiter sums positive
+drive model powers, with static chassis loss and the 4 W margin deducted from the
+budget. This drive-only policy is the intentional exception to upstream Helm
+power integration; the PowerControl module itself is unmodified.
 
-Raw RMMotor feedback torque is converted to the direction used by feedback RPM
-before power estimation and RLS. The limiter keeps current within the original
-request magnitude and sign. When a budget is physically infeasible under the
-model, it chooses the minimum-power permitted currents rather than claiming the
-budget can always be met. Telemetry powers are model estimates, not measurements;
-the steering estimate remains zero.
+Additional Helm power estimates, Ozone sampling globals, and the velocity debug
+pointer are removed. Physical chassis-velocity feedback remains part of the
+migrated motion controller. The motor target names at the power-control boundary
+match upstream: `target_speed_` is motor rotor RPM and `target_angle_` is radians.
+RMMotor decodes torque using the same configured direction as velocity, so power
+identification consumes aligned feedback directly; the extra torque-polarity
+interface is no longer needed.
+Confirm the SuperPower protocol and actual power-meter coverage before relying
+on online power identification.
 
 `moment_of_inertia` defaults to zero in the other product configurations. It is
 forwarded only to Helm; Omni and Mecanum keep their current parameter contracts.
@@ -59,10 +64,11 @@ the parent BSP's lock file until the module commits are published and relocked.
 2. Apply small +y, +x and pure rotation commands. Check wheel angle, drive sign,
    and measured chassis velocity; verify FOLLOW decreases the yaw error.
 3. Check steering hold at zero input and reduced wheel targets during steering
-   alignment. Record estimated drive power, actual metered power and limited
-   current without including steering in the requested budget.
+   alignment. Check actual metered drive power and limited drive currents against
+   the drive budget. Steering power is outside that budget; verify the measurement
+   branch before using online identification.
 4. Only after those checks, test on the floor at low speed. Observe braking,
    mode transitions, feedback validity, current and power before raising limits.
 
-Compilation and host power-limiter tests do not validate physical direction,
+Compilation does not validate physical direction,
 power-meter coverage, PID tuning, or closed-loop stability on the robot.
