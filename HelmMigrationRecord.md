@@ -21,6 +21,11 @@ only BlinkLED and is not the product configuration used for this migration.
   reversal, cos-cubed speed compensation, chassis-velocity feedback, and wheel
   torque feedforward are retained. Wheel-speed PID uses observed chassis velocity
   projected along each actual steering direction, matching the source.
+- INDEPENDENT and ROTOR use the joystick z command for target angular velocity.
+  FOLLOW uses a 2-degree deadband on the signed shortest yaw error: inside the
+  deadband, target angular velocity is zero and the follow PID is reset. Outside
+  it, normal following resumes. Kinematics and inverse dynamics share that target;
+  the deadband has no hysteresis.
 - The current default configuration selects RELAX / FOLLOW / ROTOR from top to
   bottom on the left switch. The right switch selects gimbal RELAX / COMMON / COMMON.
 - Existing hardware registrations, CAN receive/transport implementation, other
@@ -55,6 +60,12 @@ on online power identification.
 forwarded only to Helm; Omni and Mecanum keep their current parameter contracts.
 Module edits live in the modules' own Git repositories and are not captured by
 the parent BSP's lock file until the module commits are published and relocked.
+
+## Friction measurement
+
+The user reports a measured wheel-ground friction coefficient of approximately
+0.4. This is a recorded bench observation; no grip or acceleration constraint
+has been added to the controller.
 
 ## Hardware validation still required
 

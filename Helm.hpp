@@ -404,11 +404,24 @@ class Helm
         break;
       case ChassisMode::INDEPENDENT:
       case ChassisMode::ROTOR:
-        target_omega_ = 0.5 * MAX_CHASSIS_OMEGA;
+        target_omega_ = cmd_data_.z * MAX_CHASSIS_OMEGA;
         break;
       case ChassisMode::FOLLOW:
-        target_omega_ =
-            -pid_follow_.Calculate(0.0f, current_yaw_, dt_) * MAX_CHASSIS_OMEGA;
+        /* 增加FOLLOW死区，避免不期望抖动 */
+        {
+          const float BETA = LibXR::CycleValue<float>(current_yaw_) - 0.0f;
+          constexpr float FOLLOW_DEADZONE = static_cast<float>(M_PI) / 90.0f;
+          if (std::fabs(BETA) < FOLLOW_DEADZONE)
+          {
+            target_omega_ = 0.0f;
+            pid_follow_.Reset();
+          }
+          else
+          {
+            target_omega_ =
+                -pid_follow_.Calculate(0.0f, current_yaw_, dt_) * MAX_CHASSIS_OMEGA;
+          }
+        }
         break;
       default:
         target_omega_ = 0.0f;
