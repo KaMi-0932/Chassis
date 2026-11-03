@@ -31,41 +31,62 @@ only BlinkLED and is not the product configuration used for this migration.
 - Existing hardware registrations, CAN receive/transport implementation, other
   module constructor interfaces, and configurable Topic names are retained.
 
-## Upstream power policy
+## Acceleration, traction and signed power constraints
 
-PowerControl is restored to QDU-Robomaster/PowerControl at upstream commit
-`4097e1f6a3fad89126e82b920217961286966d84`. The Helm power-data submission, RLS
-invocation and referee/boost budget selection follow
-QDU-Robomaster/Chassis commit `32761d015294031f3d5ac8326b1a394c796302a9`.
+`AccelerationConstraint.hpp` follows sections 1.1.5 and 1.1.6 of the supplied
+swerve-controller report: Sutherland-Hodgman half-plane clipping, feasible polygon
+vertices, quadratic/segment intersections, and the power ellipse's objective
+support point. Rank-zero/rank-one quadratics, point/line polygons, negative budgets,
+and infeasible requests are handled without changing the physical quadratic.
+The solver uses fixed arrays and no dynamic allocation; intermediate double
+arithmetic improves numerical accuracy but requires software arithmetic on M4F.
 
-Only the four M3508 drive motors enter power limiting. The Helm configurations
-set `motor_count_6020` to zero, and Helm submits only M3508 data to PowerControl.
-Limited output currents replace only drive-wheel torque requests; steering keeps
-its PID output and local +/-2.5 N*m torque clamp. The upstream limiter sums positive
-drive model powers, with static chassis loss and the 4 W margin deducted from the
-budget. This drive-only policy is the intentional exception to upstream Helm
-power integration; the PowerControl module itself is unmodified.
+Decision coordinates are retained fractions x,y in [0,1] of requested translation
+and angular acceleration. Translation direction and angular acceleration sign are
+preserved. The objective is translation_weight*x + angular_weight*y. Defaults are
+1:1 in normal modes and 1:4 in ROTOR, a weighted preference rather than strict
+lexicographic priority. YAML fields `translation_acceleration_weight`,
+`angular_acceleration_weight` and `rotor_angular_acceleration_weight` are forwarded
+only to Helm. Zero requested axes have zero objective weight.
 
-Additional Helm power estimates, Ozone sampling globals, and the velocity debug
-pointer are removed. Physical chassis-velocity feedback remains part of the
-migrated motion controller. The motor target names at the power-control boundary
-match upstream: `target_speed_` is motor rotor RPM and `target_angle_` is radians.
-RMMotor decodes torque using the same configured direction as velocity, so power
-identification consumes aligned feedback directly; the extra torque-polarity
-interface is no longer needed.
-Confirm the SuperPower protocol and actual power-meter coverage before relying
-on online power identification.
+The document's equal-load traction diamond is
+|a|/(mu*g) + |alpha|*J/(mu*weight*R) <= 1. The user measured mu approximately 0.4;
+the requested conservative configured `friction_coefficient` is 0.35. Extra affine
+half-planes bound each actual PID+FF wheel torque by the minimum of 4.4 N*m,
+the 16384-LSB hardware limit, and mu*weight*wheel_radius/4. Thus the PID offset
+cannot bypass the longitudinal drive traction bound. Normal load is assumed equal;
+load transfer, lateral tire force and transient tire dynamics are not modeled.
+The constraints are model-based and do not guarantee absence of real wheel slip.
 
-`moment_of_inertia` defaults to zero in the other product configurations. It is
-forwarded only to Helm; Omni and Mecanum keep their current parameter contracts.
-Module edits live in the modules' own Git repositories and are not captured by
-the parent BSP's lock file until the module commits are published and relocked.
+Motor speeds and wheel PID outputs are frozen once per cycle. Per-wheel current
+is affine in x,y: I_i=u_i*x+v_i*y+c_i. Power is the SIGNED sum of
+kt*I_i*rpm_i + k1*I_i^2 + k2*rpm_i^2. Regenerative negative power is not clipped or
+counted twice. The constant PID loss term is k1*c_i^2. RMMotor already aligns
+feedback torque with feedback RPM, so no extra polarity interface is used.
 
-## Friction measurement
+PowerControl retains its existing RLS/legacy limiters, adding only a locked
+GetDrivePowerModel() coefficient snapshot. Helm no longer invokes the legacy
+positive-power limiter or replaces outputs with its result. Only four drive motors
+are constrained; motor_count_6020 remains zero and steering keeps its PID output
+and +/-2.5 N*m clamp. Static chassis loss and the existing 4 W control margin are
+deducted from the available chassis budget before solving.
 
-The user reports a measured wheel-ground friction coefficient of approximately
-0.4. This is a recorded bench observation; no grip or acceleration constraint
-has been added to the controller.
+Referee data older than one second, or a missing/invalid limit, selects
+HELM_CHASSIS_MAX_POWER. Existing supercap policy is preserved: only online BOOST
+adds 100/70/40 W when feedback exceeds 0.8/0.5/0.25 respectively. GetCapEnergy()
+currently decodes an output-capability ratio, not a separately measured energy
+in joules; this board-protocol interpretation still needs hardware confirmation.
+
+If full frozen PID makes the constrained request infeasible, solve again at PID
+scales 0.5 and 0 without advancing PID state. If still infeasible, or feedback,
+commands, timing or model are invalid, the output path relaxes the motors. This
+is an explicit failure fallback, not a claim that impossible modeled power can be
+met. `acceleration_constraint_result_`, `constraint_pid_scale_` and
+`constraint_output_valid_` retain the result/status inside Helm for diagnosis.
+
+Other product configurations retain their constructor contract after xrobot sync;
+only Helm receives the new fields. No vendor code is changed. Module changes remain
+local to their own repositories until explicitly committed, published and relocked.
 
 ## Hardware validation still required
 
@@ -80,6 +101,10 @@ has been added to the controller.
    branch before using online identification.
 4. Only after those checks, test on the floor at low speed. Observe braking,
    mode transitions, feedback validity, current and power before raising limits.
+
+Before enabling higher limits, measure DWT cycle count and task stack high-water
+mark on the MCU, including the worst-case three solver attempts, against the
+2 ms control period. Compilation and host solver tests do not establish timing.
 
 Compilation does not validate physical direction,
 power-meter coverage, PID tuning, or closed-loop stability on the robot.

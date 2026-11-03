@@ -129,6 +129,10 @@ class Chassis
     ///< First-order low-pass coefficient of the dynamic scale
     float moment_of_inertia =
         0.0f;  ///< Helm yaw inertia (kg*m^2); zero disables yaw feedforward.
+    float friction_coefficient = 0.35f;  ///< Helm equal-load traction model.
+    float translation_acceleration_weight = 1.0f;
+    float angular_acceleration_weight = 1.0f;
+    float rotor_angular_acceleration_weight = 4.0f;
   };
 
   /**
@@ -320,6 +324,10 @@ class Chassis
     if constexpr (std::is_same_v<ChassisType, Helm>)
     {
       result.moment_of_inertia = param.moment_of_inertia;
+      result.friction_coefficient = param.friction_coefficient;
+      result.translation_acceleration_weight = param.translation_acceleration_weight;
+      result.angular_acceleration_weight = param.angular_acceleration_weight;
+      result.rotor_angular_acceleration_weight = param.rotor_angular_acceleration_weight;
     }
     return result;
   }
