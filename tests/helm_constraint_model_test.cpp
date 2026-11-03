@@ -179,8 +179,8 @@ void check_result(const Scenario& scenario, const Model& model,
     const float AFFINE_CURRENT = MOTOR.u * X + MOTOR.v * Y + MOTOR.c;
     near(TORQUE * CURRENT_PER_TORQUE, AFFINE_CURRENT, 0.005);
   }
-  // Separate float reconstruction may differ slightly from the solver's double
-  // evaluation.
+  // Separate reconstruction may differ slightly from the solver's affine
+  // current evaluation.
   assert(output_power(scenario, model, X, Y) <= scenario.power_budget + 3e-4);
 }
 
@@ -311,6 +311,33 @@ void pid_fallbacks()
   }
 }
 
+void high_demand_saturation()
+{
+  // Large stick steps exercise the traction-limited vertex path and large
+  // affine coefficients, rather than only the small-command early return.
+  for (const float ACCELERATION : {20.0f, 80.0f, 200.0f})
+  {
+    for (const float RPM : {0.0f, 3000.0f, -3000.0f})
+    {
+      Scenario scenario;
+      scenario.ay = ACCELERATION;
+      scenario.rpm.fill(RPM);
+      scenario.power_budget = 90.5f;
+      const Model MODEL = make_model(scenario, 0.0f);
+      const auto RESULT = AccelerationConstraint::Solve(MODEL.input);
+      check_result(scenario, MODEL, RESULT);
+      assert(RESULT.point.x < 1.0f);
+      assert(RESULT.point.x > 0.0f);
+      // At rest traction alone sets the optimum; the retained acceleration
+      // must remain independent of the raw acceleration request's magnitude.
+      if (RPM == 0.0f)
+      {
+        near(ACCELERATION * RESULT.point.x, MU * GRAVITY, 3e-5);
+      }
+    }
+  }
+}
+
 void random_physical_scenarios()
 {
   std::mt19937 random(0xc0ffeeU);
@@ -375,6 +402,7 @@ int main()
   feedforward_equivalence();
   deterministic();
   pid_fallbacks();
+  high_demand_saturation();
   random_physical_scenarios();
   std::puts(
       "PASS: 5000 FF equivalence cases, physical torque/current/grip/power bounds, "

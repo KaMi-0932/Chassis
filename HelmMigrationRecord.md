@@ -38,8 +38,13 @@ swerve-controller report: Sutherland-Hodgman half-plane clipping, feasible polyg
 vertices, quadratic/segment intersections, and the power ellipse's objective
 support point. Rank-zero/rank-one quadratics, point/line polygons, negative budgets,
 and infeasible requests are handled without changing the physical quadratic.
-The solver uses fixed arrays and no dynamic allocation; intermediate double
-arithmetic improves numerical accuracy but requires software arithmetic on M4F.
+The solver uses fixed arrays and no dynamic allocation. Its arithmetic is single
+precision for the M4F hardware FPU. It first checks the full request, then the
+polygon's objective-maximizing vertex, before enumerating power intersections and
+support points. Thin ellipses use a rotated Gram matrix constructed from motor
+current coefficients. Rounded boundary candidates are checked against the actual
+float current/power expressions and, if needed, moved toward a known lower-power
+feasible point without relaxing the power limit.
 
 Decision coordinates are retained fractions x,y in [0,1] of requested translation
 and angular acceleration. Translation direction and angular acceleration sign are
@@ -78,11 +83,44 @@ currently decodes an output-capability ratio, not a separately measured energy
 in joules; this board-protocol interpretation still needs hardware confirmation.
 
 If full frozen PID makes the constrained request infeasible, solve again at PID
-scales 0.5 and 0 without advancing PID state. If still infeasible, or feedback,
-commands, timing or model are invalid, the output path relaxes the motors. This
-is an explicit failure fallback, not a claim that impossible modeled power can be
-met. `acceleration_constraint_result_`, `constraint_pid_scale_` and
-`constraint_output_valid_` retain the result/status inside Helm for diagnosis.
+scales 0.5 and 0 without advancing PID state. If the solver still reports
+INFEASIBLE, drive torque is zero while valid steering control continues, avoiding
+relax/re-enable cycles of the steering motors. Invalid feedback, commands, timing,
+model or solver input still relax all motors, as does RELAX. Zero drive current
+is an explicit fallback, not a claim that impossible modeled power can be met:
+the speed-loss term alone can exceed the budget. `acceleration_constraint_result_`,
+`constraint_pid_scale_`, `constraint_output_valid_` and `constraint_infeasible_`
+retain the result/status inside Helm for diagnosis.
+
+The control thread uses a 2 ms scheduled period. A missed release is discarded
+and the schedule is restarted, avoiding back-to-back catch-up iterations. This
+does not make an overlong computation meet its deadline. `Sleep(1)` would instead
+add a tick delay to variable computation time and does not enforce a 2 ms period.
+
+`control_diagnostics_` is an instance member, with no fixed RAM globals or printing
+in the control loop. Work durations use the existing microsecond timebase and
+include interrupts, preemption and mutex waits. Inspect these on the MCU:
+
+| Member | Meaning |
+| --- | --- |
+| `period_us`, `max_period_us` | Update-to-Update interval, including sleep, matching `dt_` |
+| `loop_time_us`, `max_loop_time_us` | Complete iteration work, excluding scheduled sleep |
+| `loop_overrun_count` | Iterations with work lasting at least 2000 us |
+| `period_over_3ms_count` | Update intervals lasting at least 3000 us |
+| `power_control_time_us`, `max_power_control_time_us` | Entire power/traction update, including all retries |
+| `model_update_time_us`, `max_model_update_time_us` | Motor-data submission, online identification and model snapshot |
+| `solve_time_us`, `max_solve_time_us` | Last individual solve and maximum individual solve |
+| `total_solve_time_us`, `solver_attempts` | Sum of solve times and attempt count in the latest iteration |
+| `output_time_us`, `max_output_time_us` | Motor command submission, including any driver logging |
+| `infeasible_count`, `invalid_solver_input_count` | Failed solver cycles, excluding early feedback/model rejection |
+| `stack_min_free_bytes` | FreeRTOS stack high-water mark in bytes, sampled every 256 iterations when enabled |
+| `drive_power_budget`, `power_model` | Budget after static loss/margin, and live coefficients |
+| `requested_ax`, `requested_ay`, `requested_alpha` | Acceleration requests before constraint scaling |
+
+Watch maxima over repeated constraint activation and all three retry paths;
+average solve duration cannot establish a 2 ms worst-case bound. If solver time
+is short while iteration time is long, investigate other tasks, driver output
+and logging. This driver can log on every command when a motor exceeds 75 C.
 
 Other product configurations retain their constructor contract after xrobot sync;
 only Helm receives the new fields. No vendor code is changed. Module changes remain

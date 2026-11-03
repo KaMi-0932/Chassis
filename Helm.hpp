@@ -299,6 +299,7 @@ class Helm
     helm->mutex_.Unlock();
     while (true)
     {
+      const auto LOOP_START = LibXR::Timebase::GetMicroseconds();
       if (cmd_suber.Available())
       {
         helm->cmd_data_ = cmd_suber.GetData();
@@ -329,10 +330,42 @@ class Helm
       helm->CompensateWheelSpeed();
       helm->DynamicInverseSolution();
       helm->CalculateMotorCurrent();
+      const auto POWER_START = LibXR::Timebase::GetMicroseconds();
       helm->PowerControlUpdate();
+      helm->control_diagnostics_.power_control_time_us = ElapsedMicroseconds(POWER_START);
+      helm->control_diagnostics_.max_power_control_time_us =
+          std::max(helm->control_diagnostics_.max_power_control_time_us,
+                   helm->control_diagnostics_.power_control_time_us);
       helm->mutex_.Unlock();
+      const auto OUTPUT_START = LibXR::Timebase::GetMicroseconds();
       helm->Output();
-      helm->thread_.SleepUntil(last_time, 2);
+      auto& diagnostics = helm->control_diagnostics_;
+      diagnostics.output_time_us = ElapsedMicroseconds(OUTPUT_START);
+      diagnostics.max_output_time_us =
+          std::max(diagnostics.max_output_time_us, diagnostics.output_time_us);
+      ++diagnostics.loop_count;
+#if defined(LIBXR_SYSTEM_freertos) && INCLUDE_uxTaskGetStackHighWaterMark == 1
+      if ((diagnostics.loop_count & 255U) == 0U)
+      {
+        diagnostics.stack_min_free_bytes =
+            uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t);
+      }
+#endif
+      diagnostics.loop_time_us = ElapsedMicroseconds(LOOP_START);
+      diagnostics.max_loop_time_us =
+          std::max(diagnostics.max_loop_time_us, diagnostics.loop_time_us);
+      if (diagnostics.loop_time_us >= CONTROL_PERIOD_US)
+      {
+        ++diagnostics.loop_overrun_count;
+      }
+      const auto NOW_MS = LibXR::Timebase::GetMilliseconds();
+      if ((NOW_MS - last_time).ToMillisecond() >= CONTROL_PERIOD_MS)
+      {
+        // Skip missed releases instead of running back-to-back catch-up loops.
+        last_time = NOW_MS;
+        ++diagnostics.schedule_reset_count;
+      }
+      helm->thread_.SleepUntil(last_time, CONTROL_PERIOD_MS);
     }
   }
   /**
@@ -343,6 +376,14 @@ class Helm
   {
     auto now = LibXR::Timebase::GetMicroseconds();
     dt_ = (now - last_online_time_).ToSecondf();
+    control_diagnostics_.period_us =
+        static_cast<uint32_t>((now - last_online_time_).ToMicrosecond());
+    control_diagnostics_.max_period_us =
+        std::max(control_diagnostics_.max_period_us, control_diagnostics_.period_us);
+    if (control_diagnostics_.period_us >= 3000U)
+    {
+      ++control_diagnostics_.period_over_3ms_count;
+    }
     last_online_time_ = now;
 
     feedback_valid_ = true;
@@ -470,8 +511,16 @@ class Helm
   void PowerControlUpdate()
   {
     constraint_output_valid_ = false;
+    constraint_infeasible_ = false;
     constraint_pid_scale_ = 0.0f;
     acceleration_constraint_result_ = {};
+    control_diagnostics_.solver_attempts = 0;
+    control_diagnostics_.solve_time_us = 0;
+    control_diagnostics_.total_solve_time_us = 0;
+    control_diagnostics_.model_update_time_us = 0;
+    control_diagnostics_.requested_ax = target_ax_;
+    control_diagnostics_.requested_ay = target_ay_;
+    control_diagnostics_.requested_alpha = target_alpha_;
     if (chassis_event_ == ChassisMode::RELAX || !feedback_valid_ ||
         !measured_chassis_velocity_.valid || !std::isfinite(dt_) || dt_ <= 0.0f ||
         !std::isfinite(target_vx_) || !std::isfinite(target_vy_) ||
@@ -480,6 +529,7 @@ class Helm
       return;
     }
 
+    const auto MODEL_START = LibXR::Timebase::GetMicroseconds();
     // Feedback and command currents use the same configured motor direction.
     for (int i = 0; i < 4; i++)
     {
@@ -491,6 +541,11 @@ class Helm
                                      motor_data_.rotorspeed_rpm_3508);
     power_control_->CalculatePowerControlParam();
     const auto MODEL = power_control_->GetDrivePowerModel();
+    control_diagnostics_.model_update_time_us = ElapsedMicroseconds(MODEL_START);
+    control_diagnostics_.max_model_update_time_us =
+        std::max(control_diagnostics_.max_model_update_time_us,
+                 control_diagnostics_.model_update_time_us);
+    control_diagnostics_.power_model = MODEL;
     if (!MODEL.valid || !std::isfinite(PARAM.friction_coefficient) ||
         PARAM.friction_coefficient <= 0.0f || !std::isfinite(PARAM.gravity) ||
         PARAM.gravity <= 0.0f || !std::isfinite(PARAM.wheel_radius) ||
@@ -512,6 +567,7 @@ class Helm
     const float CURRENT_LIMIT = TORQUE_LIMIT * CURRENT_PER_TORQUE;
     AccelerationConstraint::Input input{};
     input.power_budget = GetChassisPowerBudget() - MODEL.static_loss - MODEL.margin;
+    control_diagnostics_.drive_power_budget = input.power_budget;
     input.weights = {
         TRANSLATION_REQUEST > 1.0e-6f ? PARAM.translation_acceleration_weight : 0.0f,
         fabsf(target_alpha_) > 1.0e-6f ? (chassis_event_ == ChassisMode::ROTOR
@@ -545,7 +601,13 @@ class Helm
         input.halfplanes[input.halfplane_count++] = {-motor.u, -motor.v,
                                                      CURRENT_LIMIT + motor.c};
       }
+      const auto SOLVE_START = LibXR::Timebase::GetMicroseconds();
       acceleration_constraint_result_ = AccelerationConstraint::Solve(input);
+      control_diagnostics_.solve_time_us = ElapsedMicroseconds(SOLVE_START);
+      control_diagnostics_.max_solve_time_us = std::max(
+          control_diagnostics_.max_solve_time_us, control_diagnostics_.solve_time_us);
+      control_diagnostics_.total_solve_time_us += control_diagnostics_.solve_time_us;
+      ++control_diagnostics_.solver_attempts;
       if (acceleration_constraint_result_.feasible)
       {
         constraint_pid_scale_ = pid_scale;
@@ -555,8 +617,18 @@ class Helm
     }
     if (!constraint_output_valid_)
     {
-      // Do not claim an impossible electrical budget was met. Output() relaxes
-      // the motors; zero acceleration alone may still exceed the loss model.
+      constraint_infeasible_ = acceleration_constraint_result_.status ==
+                               AccelerationConstraint::Status::INFEASIBLE;
+      if (constraint_infeasible_)
+      {
+        ++control_diagnostics_.infeasible_count;
+      }
+      else
+      {
+        ++control_diagnostics_.invalid_solver_input_count;
+      }
+      // Zero drive current is the fallback, not a feasible optimum. Speed loss
+      // alone can exceed the budget. Keep valid steering control independent.
       return;
     }
 
@@ -903,7 +975,14 @@ class Helm
    */
   void Output()
   {
-    if (chassis_event_ == ChassisMode::RELAX || !constraint_output_valid_)
+    bool finite_output = true;
+    for (int i = 0; i < 4; i++)
+    {
+      finite_output = finite_output && std::isfinite(steer_out_[i]) &&
+                      (!constraint_output_valid_ || std::isfinite(wheel_out_[i]));
+    }
+    if (chassis_event_ == ChassisMode::RELAX || !feedback_valid_ || !finite_output ||
+        (!constraint_output_valid_ && !constraint_infeasible_))
     {
       LostCtrl();
     }
@@ -911,7 +990,8 @@ class Helm
     {
       for (int i = 0; i < 4; i++)
       {
-        motor_wheel_cmd_[i].torque = std::clamp(wheel_out_[i], -4.4f, 4.4f);
+        motor_wheel_cmd_[i].torque =
+            constraint_output_valid_ ? std::clamp(wheel_out_[i], -4.4f, 4.4f) : 0.0f;
         motor_steer_cmd_[i].torque = std::clamp(steer_out_[i], -2.5f, 2.5f);
       }
       for (int i = 0; i < 4; i++)
@@ -924,6 +1004,50 @@ class Helm
 
  private:
   const ChassisParam PARAM;
+
+  static constexpr uint32_t CONTROL_PERIOD_MS = 2;
+  static constexpr uint32_t CONTROL_PERIOD_US = CONTROL_PERIOD_MS * 1000;
+
+  static uint32_t ElapsedMicroseconds(LibXR::MicrosecondTimestamp start)
+  {
+    return static_cast<uint32_t>(
+        (LibXR::Timebase::GetMicroseconds() - start).ToMicrosecond());
+  }
+
+  // Instance diagnostics only: no logging or global sampling symbols in the loop.
+  // Work times include preemption and lock waits, but exclude scheduled sleep.
+  // period_us measures Update-to-Update, including sleep, just like dt_.
+  struct ControlDiagnostics
+  {
+    uint32_t loop_count = 0;
+    uint32_t loop_time_us = 0;
+    uint32_t max_loop_time_us = 0;
+    uint32_t period_us = 0;
+    uint32_t max_period_us = 0;
+    uint32_t period_over_3ms_count = 0;
+    uint32_t loop_overrun_count = 0;
+    uint32_t schedule_reset_count = 0;
+    uint32_t power_control_time_us = 0;
+    uint32_t max_power_control_time_us = 0;
+    uint32_t output_time_us = 0;
+    uint32_t max_output_time_us = 0;
+    uint32_t model_update_time_us = 0;
+    uint32_t max_model_update_time_us = 0;
+    uint32_t solve_time_us = 0;
+    uint32_t max_solve_time_us = 0;
+    uint32_t total_solve_time_us = 0;
+    uint32_t solver_attempts = 0;
+    uint32_t infeasible_count = 0;
+    uint32_t invalid_solver_input_count = 0;
+    uint32_t stack_min_free_bytes = 0;
+    float drive_power_budget = 0.0f;
+    float requested_ax = 0.0f;
+    float requested_ay = 0.0f;
+    float requested_alpha = 0.0f;
+    PowerControl::DrivePowerModel power_model{};
+  };
+
+  ControlDiagnostics control_diagnostics_{};
 
   struct WheelPosition
   {
@@ -1103,6 +1227,7 @@ class Helm
   MotorData motor_data_ = {};
   PowerControl* power_control_;
   bool constraint_output_valid_ = false;
+  bool constraint_infeasible_ = false;
   float constraint_pid_scale_ = 0.0f;
   AccelerationConstraint::Result acceleration_constraint_result_{};
 

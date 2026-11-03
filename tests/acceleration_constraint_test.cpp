@@ -161,6 +161,21 @@ void deterministic()
   assert(!result.feasible && !result.minimum_available &&
          result.status == Status::INFEASIBLE);
 
+  // Near-collinear motor vectors produce a thin interior ellipse. Forming
+  // a*c-b*b in float would erase its small but physically significant axis.
+  input = {};
+  input.motors[0] = {10000.0f, 10000.0f, -10000.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+  input.motors[1] = {1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+  input.power_budget = 0.1f;
+  input.weights = {1.0f, 4.0f};
+  result = Solve(input);
+  check_feasible(input, result);
+  const double SUPPORT = std::sqrt(0.1 / (6.25e-8 + 2.25));
+  near(result.point.x,
+       static_cast<float>((1.0 + 2.5e-8 * SUPPORT - 1.5 * SUPPORT) / 2.0));
+  near(result.point.y,
+       static_cast<float>((1.0 + 2.5e-8 * SUPPORT + 1.5 * SUPPORT) / 2.0));
+
   input = {};
   input.power_budget = std::numeric_limits<float>::quiet_NaN();
   assert(Solve(input).status == Status::INVALID_INPUT);
