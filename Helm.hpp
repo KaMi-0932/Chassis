@@ -441,6 +441,11 @@ class Helm
   {
     const float MAX_WHEEL_LINEAR_SPEED = GetMaxWheelLinearSpeed();
     const float MAX_CHASSIS_OMEGA = GetMaxChassisOmega();
+    if (chassis_event_ != ChassisMode::ROTOR)
+    {
+      rotor_ramped_vx_ = 0.0f;
+      rotor_ramped_vy_ = 0.0f;
+    }
 
     /* 先生成目标角速度。 */
     switch (chassis_event_)
@@ -450,9 +455,11 @@ class Helm
         break;
       case ChassisMode::INDEPENDENT:
       case ChassisMode::ROTOR:
-        target_omega_ = cmd_data_.z * MAX_CHASSIS_OMEGA;
+        target_omega_ = 0.7 * MAX_CHASSIS_OMEGA;
         break;
       case ChassisMode::FOLLOW:
+        target_omega_ =
+            -pid_follow_.Calculate(0.0f, current_yaw_, dt_) * MAX_CHASSIS_OMEGA;
         /* 增加FOLLOW死区，避免不期望抖动 */
         {
           const float BETA = LibXR::CycleValue<float>(current_yaw_) - 0.0f;
@@ -488,13 +495,39 @@ class Helm
       case ChassisMode::FOLLOW:
       case ChassisMode::ROTOR:
       {
-        const float BETA = current_yaw_;
+        const float BETA = 2 * current_yaw_;
         const float COS_BETA = cosf(BETA);
         const float SIN_BETA = sinf(BETA);
         target_vx_ =
             (COS_BETA * cmd_data_.x - SIN_BETA * cmd_data_.y) * MAX_WHEEL_LINEAR_SPEED;
         target_vy_ =
             (SIN_BETA * cmd_data_.x + COS_BETA * cmd_data_.y) * MAX_WHEEL_LINEAR_SPEED;
+        /*限制平移速度来保持自旋*/
+        if (chassis_event_ == ChassisMode::ROTOR)
+        {
+          constexpr float MAX_TRANSLATION_SPEED = 1.5f;
+          // constexpr float MAX_TRANSLATION_ACCELERATION = 1.0f;
+          const float REQUESTED_SPEED = hypotf(target_vx_, target_vy_);
+          if (REQUESTED_SPEED > MAX_TRANSLATION_SPEED)
+          {
+            const float SPEED_SCALE = MAX_TRANSLATION_SPEED / REQUESTED_SPEED;
+            target_vx_ *= SPEED_SCALE;
+            target_vy_ *= SPEED_SCALE;
+          }
+
+          // const float DELTA_X = target_vx_ - rotor_ramped_vx_;
+          // const float DELTA_Y = target_vy_ - rotor_ramped_vy_;
+          // const float DELTA_SPEED = hypotf(DELTA_X, DELTA_Y);
+          // const float MAX_DELTA_SPEED = MAX_TRANSLATION_ACCELERATION * dt_;
+          // if (DELTA_SPEED > MAX_DELTA_SPEED && DELTA_SPEED > 0.0f)
+          // {
+          //   const float RAMP_SCALE = MAX_DELTA_SPEED / DELTA_SPEED;
+          //   target_vx_ = rotor_ramped_vx_ + DELTA_X * RAMP_SCALE;
+          //   target_vy_ = rotor_ramped_vy_ + DELTA_Y * RAMP_SCALE;
+          // }
+          // rotor_ramped_vx_ = target_vx_;
+          // rotor_ramped_vy_ = target_vy_;
+        }
       }
       break;
       default:
@@ -1149,6 +1182,8 @@ class Helm
 
   ChassisVelocity measured_chassis_velocity_{};
   bool feedback_valid_ = false;
+  float rotor_ramped_vx_ = 0.0f;
+  float rotor_ramped_vy_ = 0.0f;
   float target_vx_ = 0.0f;
   float target_vy_ = 0.0f;
   float target_omega_ = 0.0f;
