@@ -26,6 +26,7 @@ depends: []
 #include "pid.hpp"
 #include "thread.hpp"
 #include "timebase.hpp"
+#include "transform.hpp"
 
 #define M3508_NM_TO_LSB_RATIO 52437.5f /* 3508转子扭矩转化为电机控制单位的比例 */
 #define GM6020_NM_TO_LSB_RATIO 7370.0f /* 6020转子扭矩转化为电机控制单位的比例 */
@@ -283,10 +284,15 @@ class Helm
     LibXR::Topic::ASyncSubscriber<Referee::ChassisPack> referee_suber(
         helm->topic_names_.chassis_ref);
     LibXR::Topic::ASyncSubscriber<float> yawmotor_angle_suber("yawmotor_angle");
+    LibXR::Topic::ASyncSubscriber<float> pitchmotor_angle_suber("pitchmotor_angle");
+    LibXR::Topic::ASyncSubscriber<LibXR::EulerAngle<float>> euler_suber(
+        helm->topic_names_.gimbal_euler);
 
     cmd_suber.StartWaiting();
     referee_suber.StartWaiting();
     yawmotor_angle_suber.StartWaiting();
+    pitchmotor_angle_suber.StartWaiting();
+    euler_suber.StartWaiting();
 
     helm->last_online_time_ = LibXR::Timebase::GetMicroseconds();
     auto last_time = LibXR::Timebase::GetMilliseconds();
@@ -311,7 +317,25 @@ class Helm
       {
         helm->current_yaw_ = LibXR::CycleValue<float>(yawmotor_angle_suber.GetData());
         helm->delta_yaw_ = -helm->current_yaw_;
+        helm->gravity_yaw_rx_time_ = LibXR::Timebase::GetMilliseconds();
+        helm->gravity_yaw_received_ = true;
         yawmotor_angle_suber.StartWaiting();
+      }
+
+      if (pitchmotor_angle_suber.Available())
+      {
+        helm->gravity_pitch_motor_angle_ = pitchmotor_angle_suber.GetData();
+        helm->gravity_pitch_rx_time_ = LibXR::Timebase::GetMilliseconds();
+        helm->gravity_pitch_received_ = true;
+        pitchmotor_angle_suber.StartWaiting();
+      }
+
+      if (euler_suber.Available())
+      {
+        helm->gravity_euler_ = euler_suber.GetData();
+        helm->gravity_euler_rx_time_ = LibXR::Timebase::GetMilliseconds();
+        helm->gravity_euler_received_ = true;
+        euler_suber.StartWaiting();
       }
 
       helm->mutex_.Lock();
@@ -323,6 +347,7 @@ class Helm
       helm->OptimizeWheelAngle();
       helm->CompensateWheelSpeed();
       helm->DynamicInverseSolution();
+      helm->GravityFeedforward();
       helm->CalculateMotorCurrent();
       helm->PowerControlUpdate();
       helm->mutex_.Unlock();
@@ -582,7 +607,6 @@ class Helm
       return;
     }
 
-    constexpr float GRAVITY_ACCELERATION = 9.80665f;
     const float MASS = PARAM.gravity / GRAVITY_ACCELERATION;
     float sum_radius_squared = 0.0f;
     for (int i = 0; i < 4; i++)
@@ -627,6 +651,148 @@ class Helm
         target_motor_torque_ff_[i] = TORQUE_FF;
       }
     }
+  }
+
+  /**
+   * @brief 重力前馈：把重力投影到底盘平面，按实际舵角分配到四个驱动轮
+   * @details 底盘姿态由云台 IMU 欧拉角和 yaw/pitch 电机相对角反推：
+   *          g_chassis = Rz(yaw) * Rx(pitch) * R_mount * g_imu，
+   *          g_imu = R_world_imu^T * [0, 0, -g]，只依赖 roll/pitch，与 yaw 漂移无关。
+   *          以后换成底盘 IMU 时，只需替换 g_chassis 的来源。
+   */
+  void GravityFeedforward()
+  {
+    for (int i = 0; i < 4; i++)
+    {
+      gravity_torque_ff_[i] = 0.0f;
+      gravity_ff_debug_.torque[i] = 0.0f;
+    }
+    gravity_ff_debug_.active = false;
+
+    const auto NOW_MS = LibXR::Timebase::GetMilliseconds();
+    auto is_fresh = [NOW_MS](bool received, LibXR::MillisecondTimestamp rx_time)
+    { return received && (NOW_MS - rx_time).ToMillisecond() <= GRAVITY_FF_TIMEOUT_MS; };
+    const bool INPUT_VALID = is_fresh(gravity_euler_received_, gravity_euler_rx_time_) &&
+                             is_fresh(gravity_yaw_received_, gravity_yaw_rx_time_) &&
+                             is_fresh(gravity_pitch_received_, gravity_pitch_rx_time_);
+    gravity_ff_debug_.input_valid = INPUT_VALID;
+    if (chassis_event_ == ChassisMode::RELAX || !feedback_valid_ || !INPUT_VALID ||
+        !std::isfinite(dt_) || dt_ <= 0.0f)
+    {
+      ResetGravityFeedforward();
+      return;
+    }
+
+    /* IMU 系下的重力：ZYX 欧拉角重建的旋转矩阵第三行，yaw 不参与。 */
+    const float ROLL = gravity_euler_.Roll();
+    const float PITCH = gravity_euler_.Pitch();
+    const float G_IMU_X = GRAVITY_ACCELERATION * sinf(PITCH);
+    const float G_IMU_Y = -GRAVITY_ACCELERATION * cosf(PITCH) * sinf(ROLL);
+    const float G_IMU_Z = -GRAVITY_ACCELERATION * cosf(PITCH) * cosf(ROLL);
+
+    /* R_mount：芯片 x 朝前、y 朝左、z 朝上 -> 底盘约定 x 右、y 前、z 上。 */
+    const float G_P_X = -G_IMU_Y;
+    const float G_P_Y = G_IMU_X;
+    const float G_P_Z = G_IMU_Z;
+
+    /* pitch 关节绕 +x，正角抬头。 */
+    const float PITCH_JOINT = GRAVITY_FF_PITCH_SIGN * gravity_pitch_motor_angle_;
+    const float CP = cosf(PITCH_JOINT);
+    const float SP = sinf(PITCH_JOINT);
+    const float G_Y_X = G_P_X;
+    const float G_Y_Y = CP * G_P_Y - SP * G_P_Z;
+    const float G_Y_Z = SP * G_P_Y + CP * G_P_Z;
+
+    /* yaw 关节绕 +z，与 FOLLOW 模式云台系到底盘系的 Rz(current_yaw_) 约定一致。 */
+    const float YAW_JOINT = GRAVITY_FF_YAW_SIGN * static_cast<float>(current_yaw_);
+    const float CY = cosf(YAW_JOINT);
+    const float SY = sinf(YAW_JOINT);
+    const float G_BODY[3] = {CY * G_Y_X - SY * G_Y_Y, SY * G_Y_X + CY * G_Y_Y, G_Y_Z};
+    if (!std::isfinite(G_BODY[0]) || !std::isfinite(G_BODY[1]) ||
+        !std::isfinite(G_BODY[2]))
+    {
+      ResetGravityFeedforward();
+      return;
+    }
+
+    /* 一阶低通，截止频率 GRAVITY_FF_LPF_HZ。 */
+    const float RC = 1.0f / (static_cast<float>(LibXR::TWO_PI) * GRAVITY_FF_LPF_HZ);
+    const float ALPHA = dt_ / (RC + dt_);
+    for (int axis = 0; axis < 3; axis++)
+    {
+      gravity_body_filtered_[axis] =
+          gravity_filter_initialized_
+              ? gravity_body_filtered_[axis] +
+                    ALPHA * (G_BODY[axis] - gravity_body_filtered_[axis])
+              : G_BODY[axis];
+      gravity_ff_debug_.g_body[axis] = gravity_body_filtered_[axis];
+    }
+    gravity_filter_initialized_ = true;
+
+    /* 补偿加速度与重力平面分量反向。 */
+    float a_gx = -gravity_body_filtered_[0];
+    float a_gy = -gravity_body_filtered_[1];
+    const float A_G = hypotf(a_gx, a_gy);
+    const float G_NORM =
+        sqrtf(A_G * A_G + gravity_body_filtered_[2] * gravity_body_filtered_[2]);
+    const float TILT =
+        G_NORM > 1.0e-3f ? asinf(std::clamp(A_G / G_NORM, 0.0f, 1.0f)) : 0.0f;
+    gravity_ff_debug_.tilt_deg = TILT * 180.0f / static_cast<float>(M_PI);
+
+    /* 带回差的硬死区：超过开启阈值后完整补偿，低于关闭阈值才停止。 */
+    gravity_ff_engaged_ =
+        TILT > (gravity_ff_engaged_ ? GRAVITY_FF_OFF_RAD : GRAVITY_FF_ON_RAD);
+    if (!gravity_ff_engaged_)
+    {
+      gravity_ff_debug_.a_g[0] = 0.0f;
+      gravity_ff_debug_.a_g[1] = 0.0f;
+      return;
+    }
+
+    /* 超过摩擦上限的部分无论如何都会打滑，不再追加电流。 */
+    const float A_G_LIMIT = GRAVITY_FF_FRICTION * GRAVITY_ACCELERATION;
+    if (A_G > A_G_LIMIT)
+    {
+      a_gx *= A_G_LIMIT / A_G;
+      a_gy *= A_G_LIMIT / A_G;
+    }
+    gravity_ff_debug_.a_g[0] = a_gx;
+    gravity_ff_debug_.a_g[1] = a_gy;
+
+    /* 重力与运动指令无关，锁舵的轮子同样按实际舵角施加。 */
+    const float MASS = PARAM.gravity / GRAVITY_ACCELERATION;
+    const float FORCE_X = MASS * a_gx / 4.0f;
+    const float FORCE_Y = MASS * a_gy / 4.0f;
+    for (int i = 0; i < 4; i++)
+    {
+      const float STEER_ANGLE =
+          LibXR::CycleValue<float>(motor_steer_feedback_[i].abs_angle - zero_[i]);
+      const float TORQUE = PARAM.wheel_radius *
+                           (FORCE_X * sinf(STEER_ANGLE) + FORCE_Y * cosf(STEER_ANGLE));
+      if (std::isfinite(TORQUE))
+      {
+        gravity_torque_ff_[i] = TORQUE;
+        gravity_ff_debug_.torque[i] = TORQUE;
+      }
+    }
+    gravity_ff_debug_.active = true;
+  }
+
+  /**
+   * @brief 清除重力前馈的滤波和死区状态
+   */
+  void ResetGravityFeedforward()
+  {
+    gravity_filter_initialized_ = false;
+    gravity_ff_engaged_ = false;
+    for (int axis = 0; axis < 3; axis++)
+    {
+      gravity_body_filtered_[axis] = 0.0f;
+      gravity_ff_debug_.g_body[axis] = 0.0f;
+    }
+    gravity_ff_debug_.a_g[0] = 0.0f;
+    gravity_ff_debug_.a_g[1] = 0.0f;
+    gravity_ff_debug_.tilt_deg = 0.0f;
   }
 
   /**
@@ -811,7 +977,7 @@ class Helm
             dt_);
       }
       /* 与轮速 PID 同为减速器输出轴扭矩 N*m，交给现有功率控制限幅。 */
-      wheel_out_[i] += target_motor_torque_ff_[i];
+      wheel_out_[i] += target_motor_torque_ff_[i] + gravity_torque_ff_[i];
     }
   }
 
@@ -823,6 +989,10 @@ class Helm
   {
     if (power_control_data_.is_power_limited)
     {
+      if (gravity_ff_debug_.active)
+      {
+        ++gravity_ff_debug_.power_limited_count;
+      }
       /* 功率限制只替换驱动轮输出，舵向保留 PID 输出和自身扭矩限幅。 */
       for (int i = 0; i < 4; i++)
       {
@@ -853,6 +1023,29 @@ class Helm
 
  private:
   const ChassisParam PARAM;
+
+  static constexpr float GRAVITY_ACCELERATION = 9.80665f;
+  /* 重力前馈参数，不进 ChassisParam 以免改动所有底盘的配置。 */
+  static constexpr uint32_t GRAVITY_FF_TIMEOUT_MS = 50;
+  static constexpr float GRAVITY_FF_LPF_HZ = 10.0f;
+  static constexpr float GRAVITY_FF_ON_RAD = 3.0f * static_cast<float>(M_PI) / 180.0f;
+  static constexpr float GRAVITY_FF_OFF_RAD = 2.0f * static_cast<float>(M_PI) / 180.0f;
+  static constexpr float GRAVITY_FF_FRICTION = 0.7f;
+  /* 电机相对角的正方向：+1 表示 yaw 俯视逆时针为正、pitch 抬头为正。上车核对。 */
+  static constexpr float GRAVITY_FF_YAW_SIGN = 1.0f;
+  static constexpr float GRAVITY_FF_PITCH_SIGN = 1.0f;
+
+  /* Ozone 观测用，非全局。 */
+  struct GravityFeedforwardDebug
+  {
+    float g_body[3] = {0.0f, 0.0f, 0.0f};       /* 滤波后底盘系重力 (m/s^2) */
+    float a_g[2] = {0.0f, 0.0f};                /* 死区、限幅后的补偿加速度 (m/s^2) */
+    float tilt_deg = 0.0f;                      /* 底盘倾角 (deg) */
+    float torque[4] = {0.0f, 0.0f, 0.0f, 0.0f}; /* 各轮重力前馈 (N*m) */
+    bool input_valid = false;
+    bool active = false;
+    uint32_t power_limited_count = 0; /* 前馈生效且功率受限的周期数 */
+  };
 
   struct WheelPosition
   {
@@ -961,6 +1154,20 @@ class Helm
   float target_ay_ = 0.0f;    /* m/s^2 */
   float target_alpha_ = 0.0f; /* rad/s^2 */
   float target_motor_torque_ff_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float gravity_torque_ff_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  LibXR::EulerAngle<float> gravity_euler_{};
+  float gravity_pitch_motor_angle_ = 0.0f;
+  LibXR::MillisecondTimestamp gravity_euler_rx_time_ = 0;
+  LibXR::MillisecondTimestamp gravity_yaw_rx_time_ = 0;
+  LibXR::MillisecondTimestamp gravity_pitch_rx_time_ = 0;
+  bool gravity_euler_received_ = false;
+  bool gravity_yaw_received_ = false;
+  bool gravity_pitch_received_ = false;
+  float gravity_body_filtered_[3] = {0.0f, 0.0f, 0.0f};
+  bool gravity_filter_initialized_ = false;
+  bool gravity_ff_engaged_ = false;
+  GravityFeedforwardDebug gravity_ff_debug_{};
 
   bool motor_reverse_[4]{false, false, false, false};
   LibXR::CycleValue<float> zero_[4] = {1.10063124, 2.05323339, 3.2244277, 0.979446769};
