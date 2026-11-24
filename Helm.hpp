@@ -12,7 +12,6 @@ depends: []
 #include <cstdlib>
 #include <cstring>
 
-#include "AccelerationConstraint.hpp"
 #include "CMD.hpp"
 #include "Chassis.hpp"
 #include "Motor.hpp"
@@ -72,11 +71,10 @@ class Helm
     ///< Error compensation
     float gravity = 0.0f;  ///< 底盘重力 (N)，用于全向轮姿态前馈
     ///< Chassis weight (N), used by the Omni attitude feedforward
-    float length = 0.0f;  ///< 前后轮心距 (m)，与 width 同时大于 0 时按矩形布置
-    ///< Front-to-rear wheel distance (m); a rectangular layout when both it and width
-    ///< are positive
-    float width = 0.0f;  ///< 左右轮心距 (m)，为 0 时按 wheel_to_center 的正方形布置
-    ///< Left-to-right wheel distance (m); a square layout from wheel_to_center when zero
+    float length = 0.0f;  ///< 轮距的长 (m)，用于全向轮姿态前馈
+    ///< Length of the wheel layout (m), used by the Omni attitude feedforward
+    float width = 0.0f;  ///< 轮距的宽 (m)，用于全向轮姿态前馈
+    ///< Width of the wheel layout (m), used by the Omni attitude feedforward
     float rotor_speed_scale = 1.0f;  ///< 平移输入下的小陀螺转速缩放比例
     ///< Spin speed scale under translation input
     float rotor_omega_min_scale = 0.55f;  ///< 小陀螺动态缩放的下限
@@ -88,10 +86,6 @@ class Helm
     float rotor_scale_lpf_alpha = 0.2f;  ///< 动态缩放的一阶低通系数
     ///< First-order low-pass coefficient of the dynamic scale
     float moment_of_inertia = 0.0f;  ///< Yaw inertia (kg*m^2), zero disables feedforward
-    float friction_coefficient = 0.35f;
-    float translation_acceleration_weight = 1.0f;
-    float angular_acceleration_weight = 1.0f;
-    float rotor_angular_acceleration_weight = 4.0f;
   };
   /**
    * @brief 底盘模式。
@@ -306,7 +300,6 @@ class Helm
     helm->mutex_.Unlock();
     while (true)
     {
-      const auto LOOP_START = LibXR::Timebase::GetMicroseconds();
       if (cmd_suber.Available())
       {
         helm->cmd_data_ = cmd_suber.GetData();
@@ -356,42 +349,10 @@ class Helm
       helm->DynamicInverseSolution();
       helm->GravityFeedforward();
       helm->CalculateMotorCurrent();
-      const auto POWER_START = LibXR::Timebase::GetMicroseconds();
       helm->PowerControlUpdate();
-      helm->control_diagnostics_.power_control_time_us = ElapsedMicroseconds(POWER_START);
-      helm->control_diagnostics_.max_power_control_time_us =
-          std::max(helm->control_diagnostics_.max_power_control_time_us,
-                   helm->control_diagnostics_.power_control_time_us);
       helm->mutex_.Unlock();
-      const auto OUTPUT_START = LibXR::Timebase::GetMicroseconds();
       helm->Output();
-      auto& diagnostics = helm->control_diagnostics_;
-      diagnostics.output_time_us = ElapsedMicroseconds(OUTPUT_START);
-      diagnostics.max_output_time_us =
-          std::max(diagnostics.max_output_time_us, diagnostics.output_time_us);
-      ++diagnostics.loop_count;
-#if defined(LIBXR_SYSTEM_freertos) && INCLUDE_uxTaskGetStackHighWaterMark == 1
-      if ((diagnostics.loop_count & 255U) == 0U)
-      {
-        diagnostics.stack_min_free_bytes =
-            uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t);
-      }
-#endif
-      diagnostics.loop_time_us = ElapsedMicroseconds(LOOP_START);
-      diagnostics.max_loop_time_us =
-          std::max(diagnostics.max_loop_time_us, diagnostics.loop_time_us);
-      if (diagnostics.loop_time_us >= CONTROL_PERIOD_US)
-      {
-        ++diagnostics.loop_overrun_count;
-      }
-      const auto NOW_MS = LibXR::Timebase::GetMilliseconds();
-      if ((NOW_MS - last_time).ToMillisecond() >= CONTROL_PERIOD_MS)
-      {
-        // Skip missed releases instead of running back-to-back catch-up loops.
-        last_time = NOW_MS;
-        ++diagnostics.schedule_reset_count;
-      }
-      helm->thread_.SleepUntil(last_time, CONTROL_PERIOD_MS);
+      helm->thread_.SleepUntil(last_time, 2);
     }
   }
   /**
@@ -402,14 +363,6 @@ class Helm
   {
     auto now = LibXR::Timebase::GetMicroseconds();
     dt_ = (now - last_online_time_).ToSecondf();
-    control_diagnostics_.period_us =
-        static_cast<uint32_t>((now - last_online_time_).ToMicrosecond());
-    control_diagnostics_.max_period_us =
-        std::max(control_diagnostics_.max_period_us, control_diagnostics_.period_us);
-    if (control_diagnostics_.period_us >= 3000U)
-    {
-      ++control_diagnostics_.period_over_3ms_count;
-    }
     last_online_time_ = now;
 
     feedback_valid_ = true;
@@ -467,11 +420,6 @@ class Helm
   {
     const float MAX_WHEEL_LINEAR_SPEED = GetMaxWheelLinearSpeed();
     const float MAX_CHASSIS_OMEGA = GetMaxChassisOmega();
-    if (chassis_event_ != ChassisMode::ROTOR)
-    {
-      rotor_ramped_vx_ = 0.0f;
-      rotor_ramped_vy_ = 0.0f;
-    }
 
     /* 先生成目标角速度。 */
     switch (chassis_event_)
@@ -481,7 +429,7 @@ class Helm
         break;
       case ChassisMode::INDEPENDENT:
       case ChassisMode::ROTOR:
-        target_omega_ = 0.7 * MAX_CHASSIS_OMEGA;
+        target_omega_ = 0.2f * MAX_CHASSIS_OMEGA;
         break;
       case ChassisMode::FOLLOW:
         /* 增加FOLLOW死区，避免不期望抖动 */
@@ -519,26 +467,13 @@ class Helm
       case ChassisMode::FOLLOW:
       case ChassisMode::ROTOR:
       {
-        const float BETA = 2 * current_yaw_;
+        const float BETA = current_yaw_;
         const float COS_BETA = cosf(BETA);
         const float SIN_BETA = sinf(BETA);
         target_vx_ =
             (COS_BETA * cmd_data_.x - SIN_BETA * cmd_data_.y) * MAX_WHEEL_LINEAR_SPEED;
         target_vy_ =
             (SIN_BETA * cmd_data_.x + COS_BETA * cmd_data_.y) * MAX_WHEEL_LINEAR_SPEED;
-        /*限制平移速度来保持自旋*/
-        if (chassis_event_ == ChassisMode::ROTOR)
-        {
-          constexpr float MAX_TRANSLATION_SPEED = 1.5f;
-          // constexpr float MAX_TRANSLATION_ACCELERATION = 1.0f;
-          const float REQUESTED_SPEED = hypotf(target_vx_, target_vy_);
-          if (REQUESTED_SPEED > MAX_TRANSLATION_SPEED)
-          {
-            const float SPEED_SCALE = MAX_TRANSLATION_SPEED / REQUESTED_SPEED;
-            target_vx_ *= SPEED_SCALE;
-            target_vy_ *= SPEED_SCALE;
-          }
-        }
       }
       break;
       default:
@@ -554,160 +489,66 @@ class Helm
    */
   void PowerControlUpdate()
   {
-    constraint_output_valid_ = false;
-    constraint_infeasible_ = false;
-    constraint_pid_scale_ = 0.0f;
-    acceleration_constraint_result_ = {};
-    control_diagnostics_.solver_attempts = 0;
-    control_diagnostics_.solve_time_us = 0;
-    control_diagnostics_.total_solve_time_us = 0;
-    control_diagnostics_.model_update_time_us = 0;
-    control_diagnostics_.requested_ax = target_ax_;
-    control_diagnostics_.requested_ay = target_ay_;
-    control_diagnostics_.requested_alpha = target_alpha_;
-    if (chassis_event_ == ChassisMode::RELAX || !feedback_valid_ ||
-        !measured_chassis_velocity_.valid)
-    {
-      return;
-    }
-
-    const auto MODEL_START = LibXR::Timebase::GetMicroseconds();
-    // Feedback and command currents use the same configured motor direction.
+    /* 仅提交驱动轮数据；PowerControl 的 motor_count_6020 配置为 0。 */
     for (int i = 0; i < 4; i++)
     {
       motor_data_.rotorspeed_rpm_3508[i] = motor_wheel_feedback_[i].velocity;
       motor_data_.output_current_3508[i] =
           motor_wheel_feedback_[i].torque * M3508_NM_TO_LSB_RATIO;
     }
+
+    /* 第一次设置: 反馈数据用于 RLS 参数估计 */
     power_control_->SetMotorData3508(motor_data_.output_current_3508,
                                      motor_data_.rotorspeed_rpm_3508);
+
     power_control_->CalculatePowerControlParam();
-    const auto MODEL = power_control_->GetDrivePowerModel();
-    control_diagnostics_.model_update_time_us = ElapsedMicroseconds(MODEL_START);
-    control_diagnostics_.max_model_update_time_us =
-        std::max(control_diagnostics_.max_model_update_time_us,
-                 control_diagnostics_.model_update_time_us);
-    control_diagnostics_.power_model = MODEL;
-    if (!MODEL.valid)
-    {
-      return;
-    }
 
-    const float TRANSLATION_REQUEST = hypotf(target_ax_, target_ay_);
-    constexpr float GRAVITY_ACCELERATION = 9.80665f;
-    const float CURRENT_PER_TORQUE = M3508_NM_TO_LSB_RATIO / PARAM.reduction_ratio;
-    // In addition to the document's diamond, include actual PID+FF drive traction.
-    const float TORQUE_LIMIT = std::min(
-        {4.4f, 16384.0f / CURRENT_PER_TORQUE,
-         PARAM.friction_coefficient * PARAM.gravity * PARAM.wheel_radius / 4.0f});
-    const float CURRENT_LIMIT = TORQUE_LIMIT * CURRENT_PER_TORQUE;
-    AccelerationConstraint::Input input{};
-    input.power_budget = GetChassisPowerBudget() - MODEL.static_loss - MODEL.margin;
-    control_diagnostics_.drive_power_budget = input.power_budget;
-    input.weights = {
-        TRANSLATION_REQUEST > 1.0e-6f ? PARAM.translation_acceleration_weight : 0.0f,
-        fabsf(target_alpha_) > 1.0e-6f ? (chassis_event_ == ChassisMode::ROTOR
-                                              ? PARAM.rotor_angular_acceleration_weight
-                                              : PARAM.angular_acceleration_weight)
-                                       : 0.0f};
-    input.halfplanes[0] = {
-        TRANSLATION_REQUEST / (PARAM.friction_coefficient * GRAVITY_ACCELERATION),
-        fabsf(target_alpha_) * PARAM.moment_of_inertia /
-            (PARAM.friction_coefficient * PARAM.gravity * GetWheelToCenter()),
-        1.0f};
-
-    // PID state is advanced only once by CalculateMotorCurrent. If its fixed
-    // offset makes the request box infeasible, retry with less PID contribution.
-    constexpr float PID_SCALES[] = {1.0f, 0.5f, 0.0f};
-    for (float pid_scale : PID_SCALES)
-    {
-      input.halfplane_count = 1;
-      for (int i = 0; i < 4; i++)
-      {
-        auto& motor = input.motors[i];
-        motor = {wheel_translation_ff_[i] * CURRENT_PER_TORQUE,
-                 wheel_rotation_ff_[i] * CURRENT_PER_TORQUE,
-                 pid_scale * wheel_pid_out_[i] * CURRENT_PER_TORQUE,
-                 motor_data_.rotorspeed_rpm_3508[i],
-                 MODEL.kt,
-                 MODEL.k1,
-                 MODEL.k2};
-        input.halfplanes[input.halfplane_count++] = {motor.u, motor.v,
-                                                     CURRENT_LIMIT - motor.c};
-        input.halfplanes[input.halfplane_count++] = {-motor.u, -motor.v,
-                                                     CURRENT_LIMIT + motor.c};
-      }
-      const auto SOLVE_START = LibXR::Timebase::GetMicroseconds();
-      acceleration_constraint_result_ = AccelerationConstraint::Solve(input);
-      control_diagnostics_.solve_time_us = ElapsedMicroseconds(SOLVE_START);
-      control_diagnostics_.max_solve_time_us = std::max(
-          control_diagnostics_.max_solve_time_us, control_diagnostics_.solve_time_us);
-      control_diagnostics_.total_solve_time_us += control_diagnostics_.solve_time_us;
-      ++control_diagnostics_.solver_attempts;
-      if (acceleration_constraint_result_.feasible)
-      {
-        constraint_pid_scale_ = pid_scale;
-        constraint_output_valid_ = true;
-        break;
-      }
-    }
-    if (!constraint_output_valid_)
-    {
-      constraint_infeasible_ = acceleration_constraint_result_.status ==
-                               AccelerationConstraint::Status::INFEASIBLE;
-      if (constraint_infeasible_)
-      {
-        ++control_diagnostics_.infeasible_count;
-      }
-      else
-      {
-        ++control_diagnostics_.invalid_solver_input_count;
-      }
-      // Zero drive current is the fallback, not a feasible optimum. Speed loss
-      // alone can exceed the budget. Keep valid steering control independent.
-      return;
-    }
-
-    const auto SCALE = acceleration_constraint_result_.point;
-    target_ax_ *= SCALE.x;
-    target_ay_ *= SCALE.x;
-    target_alpha_ *= SCALE.y;
+    /* 计算 3508 速度跟踪误差 */
+    float speed_error_3508[4];
     for (int i = 0; i < 4; i++)
     {
-      target_motor_torque_ff_[i] =
-          SCALE.x * wheel_translation_ff_[i] + SCALE.y * wheel_rotation_ff_[i];
-      wheel_out_[i] =
-          constraint_pid_scale_ * wheel_pid_out_[i] + target_motor_torque_ff_[i];
-    }
-  }
+      float actual_speed = motor_reverse_[i] ? -motor_wheel_feedback_[i].velocity
+                                             : motor_wheel_feedback_[i].velocity;
+      speed_error_3508[i] = target_speed_[i] - actual_speed;
 
-  float GetChassisPowerBudget()
-  {
-    const auto NOW_MS = LibXR::Timebase::GetMilliseconds();
-    const bool REFEREE_ONLINE = (NOW_MS - referee_last_rx_time_).ToSecondf() <= 1.0f;
+      motor_data_.output_current_3508[i] =
+          std::clamp(wheel_out_[i] * M3508_NM_TO_LSB_RATIO / PARAM.reduction_ratio,
+                     -16384.0f, 16384.0f);
+    }
+
+    power_control_->SetMotorData3508(motor_data_.output_current_3508,
+                                     motor_data_.rotorspeed_rpm_3508, speed_error_3508);
+
+    auto now_ms = LibXR::Timebase::GetMilliseconds();
+    bool referee_online = (now_ms - referee_last_rx_time_).ToSecondf() <= 1.0f;
+    bool power_control_online = power_control_->IsOnline();
+    bool boost_mode = (cmd_data_.self_define == CMD::ChasStat::BOOST);
+
     float max_power = static_cast<float>(referee_chassis_pack_.rs.chassis_power_limit);
-    if (!REFEREE_ONLINE || max_power <= 1.0f)
+    if (!referee_online || max_power <= 1.0f)
     {
       max_power = HELM_CHASSIS_MAX_POWER;
     }
-    if (power_control_->IsOnline() && cmd_data_.self_define == CMD::ChasStat::BOOST)
+
+    if (power_control_online && boost_mode)
     {
-      // Preserve the existing board feedback interpretation and boost tiers.
-      const float CAP_LEVEL = power_control_->GetCapEnergy();
-      if (CAP_LEVEL > 0.8f)
-      {
-        max_power += 300.0f;
-      }
-      else if (CAP_LEVEL > 0.5f)
-      {
-        max_power += 200.0f;
-      }
-      else if (CAP_LEVEL > 0.25f)
+      float cap_energy = power_control_->GetCapEnergy();
+      if (cap_energy > 0.8f)
       {
         max_power += 100.0f;
       }
+      else if (cap_energy > 0.5f)
+      {
+        max_power += 70.0f;
+      }
+      else if (cap_energy > 0.25f)
+      {
+        max_power += 40.0f;
+      }
     }
-    return max_power;
+
+    power_control_->OutputLimit(max_power);
+    power_control_data_ = power_control_->GetPowerControlData();
   }
 
   /**
@@ -722,11 +563,19 @@ class Helm
     for (int i = 0; i < 4; i++)
     {
       target_motor_torque_ff_[i] = 0.0f;
-      wheel_translation_ff_[i] = 0.0f;
-      wheel_rotation_ff_[i] = 0.0f;
     }
 
-    if (chassis_event_ == ChassisMode::RELAX || !measured_chassis_velocity_.valid)
+    const float MAX_WHEEL_LINEAR_SPEED = GetMaxWheelLinearSpeed();
+    const float MAX_CHASSIS_OMEGA = GetMaxChassisOmega();
+    if (chassis_event_ == ChassisMode::RELAX ||
+
+        !measured_chassis_velocity_.valid || !std::isfinite(dt_) ||
+        !std::isfinite(target_vx_) || !std::isfinite(target_vy_) ||
+        !std::isfinite(target_omega_) || dt_ <= 0.0f ||
+        !std::isfinite(MAX_WHEEL_LINEAR_SPEED) || MAX_WHEEL_LINEAR_SPEED <= 0.0f ||
+        !std::isfinite(MAX_CHASSIS_OMEGA) || MAX_CHASSIS_OMEGA <= 0.0f ||
+        !std::isfinite(PARAM.gravity) || PARAM.gravity <= 0.0f ||
+        !std::isfinite(PARAM.moment_of_inertia) || PARAM.moment_of_inertia < 0.0f)
     {
       pid_velocity_x_.Reset();
       pid_velocity_y_.Reset();
@@ -766,6 +615,11 @@ class Helm
       sum_radius_squared +=
           WHEEL_POSITION.x * WHEEL_POSITION.x + WHEEL_POSITION.y * WHEEL_POSITION.y;
     }
+    if (!std::isfinite(sum_radius_squared) || sum_radius_squared <= 1.0e-12f)
+    {
+      return;
+    }
+
     /* 对称四轮的最小范数分配：
      * Fx_i = m*ax/4 - J*alpha*y_i/S
      * Fy_i = m*ay/4 + J*alpha*x_i/S，S = sum(x_i^2+y_i^2)。 */
@@ -786,15 +640,12 @@ class Helm
       const WheelPosition WHEEL_POSITION = GetWheelPosition(static_cast<uint8_t>(i));
       const float STEER_ANGLE =
           LibXR::CycleValue<float>(motor_steer_feedback_[i].abs_angle - zero_[i]);
+      const float FORCE_X = TRANSLATION_FORCE_X - ROTATION_FORCE_SCALE * WHEEL_POSITION.y;
+      const float FORCE_Y = TRANSLATION_FORCE_Y + ROTATION_FORCE_SCALE * WHEEL_POSITION.x;
       /* 实际舵向的驱动正方向为 (sin(a), cos(a))。
        * 投影已包含方向，不再按 motor_reverse 取反或重复乘 cos^3。 */
-      wheel_translation_ff_[i] =
-          PARAM.wheel_radius * (TRANSLATION_FORCE_X * sinf(STEER_ANGLE) +
-                                TRANSLATION_FORCE_Y * cosf(STEER_ANGLE));
-      wheel_rotation_ff_[i] =
-          PARAM.wheel_radius * ROTATION_FORCE_SCALE *
-          (-WHEEL_POSITION.y * sinf(STEER_ANGLE) + WHEEL_POSITION.x * cosf(STEER_ANGLE));
-      const float TORQUE_FF = wheel_translation_ff_[i] + wheel_rotation_ff_[i];
+      const float TORQUE_FF = PARAM.wheel_radius *
+                              (FORCE_X * sinf(STEER_ANGLE) + FORCE_Y * cosf(STEER_ANGLE));
       if (std::isfinite(TORQUE_FF))
       {
         target_motor_torque_ff_[i] = TORQUE_FF;
@@ -951,6 +802,16 @@ class Helm
   void InverseKinematicsSolution()
   {
     const float MAX_WHEEL_LINEAR_SPEED = GetMaxWheelLinearSpeed();
+    if (MAX_WHEEL_LINEAR_SPEED <= 1.0e-6f)
+    {
+      for (int i = 0; i < 4; i++)
+      {
+        target_speed_[i] = 0.0f;
+        target_angle_[i] = 0.0f;
+        steer_angle_held_[i] = false;
+      }
+      return;
+    }
     const float MOTOR_RPM_PER_MPS = motor_max_speed_ / MAX_WHEEL_LINEAR_SPEED;
     switch (chassis_event_)
     {
@@ -1067,7 +928,9 @@ class Helm
   {
     /* 轮速 PID 跟踪观测底盘速度在当前实际舵向上的投影。 */
     const float MAX_WHEEL_LINEAR_SPEED = GetMaxWheelLinearSpeed();
-    const float MOTOR_RPM_PER_MPS = measured_chassis_velocity_.valid
+    const float MOTOR_RPM_PER_MPS = measured_chassis_velocity_.valid &&
+                                            std::isfinite(MAX_WHEEL_LINEAR_SPEED) &&
+                                            MAX_WHEEL_LINEAR_SPEED > 1.0e-6f
                                         ? motor_max_speed_ / MAX_WHEEL_LINEAR_SPEED
                                         : 0.0f;
     /* 轮速目标的符号由实际舵向决定，反转状态只影响舵向控制。 */
@@ -1093,7 +956,6 @@ class Helm
       }
       wheel_out_[i] = pid_wheel_speed_[i].Calculate(
           observed_motor_rpm, motor_wheel_feedback_[i].velocity, dt_);
-      wheel_pid_out_[i] = wheel_out_[i];
       if (motor_reverse_[i])
       {
         steer_angle_[i] = pid_steer_angle_[i].Calculate(
@@ -1125,8 +987,7 @@ class Helm
    */
   void Output()
   {
-    bool finite_output = true;
-    for (int i = 0; i < 4; i++)
+    if (power_control_data_.is_power_limited)
     {
       if (gravity_ff_debug_.active)
       {
@@ -1140,8 +1001,8 @@ class Helm
                                    -4.4f, 4.4f);
       }
     }
-    if (chassis_event_ == ChassisMode::RELAX || !feedback_valid_ || !finite_output ||
-        (!constraint_output_valid_ && !constraint_infeasible_))
+
+    if (chassis_event_ == (ChassisMode::RELAX))
     {
       LostCtrl();
     }
@@ -1149,8 +1010,7 @@ class Helm
     {
       for (int i = 0; i < 4; i++)
       {
-        motor_wheel_cmd_[i].torque =
-            constraint_output_valid_ ? std::clamp(wheel_out_[i], -4.4f, 4.4f) : 0.0f;
+        motor_wheel_cmd_[i].torque = std::clamp(wheel_out_[i], -4.4f, 4.4f);
         motor_steer_cmd_[i].torque = std::clamp(steer_out_[i], -2.5f, 2.5f);
       }
       for (int i = 0; i < 4; i++)
@@ -1193,52 +1053,19 @@ class Helm
     float y;
   };
 
-  /**
-   * @brief 轮心到底盘中心的半宽与半长 (m)。
-   *        Half width and half length from the chassis center to the wheel centers (m).
-   *
-   * @details length 与 width 都大于 0 时按矩形布置，否则按 wheel_to_center 的正方形布置。
-   *          A rectangle when length and width are both positive, otherwise a square
-   *          from wheel_to_center.
-   */
-  WheelPosition GetWheelHalfExtent() const
-  {
-    if (PARAM.length > 0.0f && PARAM.width > 0.0f)
-    {
-      return {PARAM.width * 0.5f, PARAM.length * 0.5f};
-    }
-    const float COMPONENT = PARAM.wheel_to_center * 0.70710678118f;
-    return {COMPONENT, COMPONENT};
-  }
-
-  /**
-   * @brief 轮心到底盘中心的距离 (m)，矩形四轮相等。
-   *        Distance from each wheel center to the chassis center (m), equal for all four
-   *        wheels of a rectangle.
-   */
-  float GetWheelToCenter() const
-  {
-    const WheelPosition HALF = GetWheelHalfExtent();
-    return hypotf(HALF.x, HALF.y);
-  }
-
-  /**
-   * @brief 轮心在底盘坐标系下的位置 (m)，+x 向右，+y 向前。
-   *        Wheel center position in the chassis frame (m), +x right and +y forward.
-   */
   WheelPosition GetWheelPosition(uint8_t wheel_index) const
   {
-    const WheelPosition HALF = GetWheelHalfExtent();
+    const float COMPONENT = PARAM.wheel_to_center * 0.70710678118f;
     switch (wheel_index)
     {
       case 0:
-        return {-HALF.x, -HALF.y};  // Left rear, quadrant III
+        return {-COMPONENT, -COMPONENT};  // Left rear, quadrant III
       case 1:
-        return {HALF.x, -HALF.y};  // Right rear, quadrant IV
+        return {COMPONENT, -COMPONENT};  // Right rear, quadrant IV
       case 2:
-        return {HALF.x, HALF.y};  // Right front, quadrant I
+        return {COMPONENT, COMPONENT};  // Right front, quadrant I
       case 3:
-        return {-HALF.x, HALF.y};  // Left front, quadrant II
+        return {-COMPONENT, COMPONENT};  // Left front, quadrant II
       default:
         return {0.0f, 0.0f};
     }
@@ -1246,6 +1073,11 @@ class Helm
 
   float GetMaxWheelLinearSpeed() const
   {
+    if (PARAM.wheel_radius <= 1.0e-6f || PARAM.reduction_ratio <= 1.0e-6f ||
+        motor_max_speed_ <= 1.0e-6f)
+    {
+      return 0.0f;
+    }
     return motor_max_speed_ * static_cast<float>(LibXR::TWO_PI) * PARAM.wheel_radius /
            (60.0f * PARAM.reduction_ratio);
   }
@@ -1253,7 +1085,9 @@ class Helm
   float GetMaxChassisOmega() const
   {
     /* 纯旋转时轮心线速度为 |omega|*R，R 已是轮心到车体中心的距离。 */
-    return GetMaxWheelLinearSpeed() / GetWheelToCenter();
+    return PARAM.wheel_to_center > 1.0e-6f
+               ? GetMaxWheelLinearSpeed() / PARAM.wheel_to_center
+               : 0.0f;
   }
 
   /**
@@ -1263,7 +1097,8 @@ class Helm
   void SelfResolution()
   {
     measured_chassis_velocity_ = {};
-    if (!feedback_valid_)
+    if (!feedback_valid_ || PARAM.wheel_to_center <= 0.0f || PARAM.wheel_radius <= 0.0f ||
+        PARAM.reduction_ratio <= 0.0f)
     {
       return;
     }
@@ -1294,6 +1129,10 @@ class Helm
       sum_radius_squared +=
           WHEEL_POSITION.x * WHEEL_POSITION.x + WHEEL_POSITION.y * WHEEL_POSITION.y;
     }
+    if (sum_radius_squared <= 1.0e-12f)
+    {
+      return;
+    }
     measured_chassis_velocity_.x = sum_vx / 4.0f;
     measured_chassis_velocity_.y = sum_vy / 4.0f;
     measured_chassis_velocity_.omega = sum_rotation / sum_radius_squared;
@@ -1308,8 +1147,6 @@ class Helm
 
   ChassisVelocity measured_chassis_velocity_{};
   bool feedback_valid_ = false;
-  float rotor_ramped_vx_ = 0.0f;
-  float rotor_ramped_vy_ = 0.0f;
   float target_vx_ = 0.0f;
   float target_vy_ = 0.0f;
   float target_omega_ = 0.0f;
@@ -1398,10 +1235,7 @@ class Helm
 
   MotorData motor_data_ = {};
   PowerControl* power_control_;
-  bool constraint_output_valid_ = false;
-  bool constraint_infeasible_ = false;
-  float constraint_pid_scale_ = 0.0f;
-  AccelerationConstraint::Result acceleration_constraint_result_{};
+  PowerControlData power_control_data_;
 
   Referee::ChassisPack referee_chassis_pack_{};
   LibXR::MillisecondTimestamp referee_last_rx_time_ = 0;
