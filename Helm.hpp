@@ -345,7 +345,6 @@ class Helm
       helm->SelfResolution();
       helm->InverseKinematicsSolution();
       helm->OptimizeWheelAngle();
-      helm->CompensateWheelSpeed();
       helm->DynamicInverseSolution();
       helm->GravityFeedforward();
       helm->CalculateMotorCurrent();
@@ -503,14 +502,10 @@ class Helm
 
     power_control_->CalculatePowerControlParam();
 
-    /* 计算 3508 速度跟踪误差 */
-    float speed_error_3508[4];
+    /* 驱动轮不再跟踪目标转速，误差全零时 PowerControl 按各轮功率需求比例分配。 */
+    float speed_error_3508[4]{};
     for (int i = 0; i < 4; i++)
     {
-      float actual_speed = motor_reverse_[i] ? -motor_wheel_feedback_[i].velocity
-                                             : motor_wheel_feedback_[i].velocity;
-      speed_error_3508[i] = target_speed_[i] - actual_speed;
-
       motor_data_.output_current_3508[i] =
           std::clamp(wheel_out_[i] * M3508_NM_TO_LSB_RATIO / PARAM.reduction_ratio,
                      -16384.0f, 16384.0f);
@@ -797,28 +792,24 @@ class Helm
 
   /**
    * @brief 舵轮底盘逆运动学解算
-   * @details 根据底盘目标速度计算各轮目标舵角与电机转子转速
+   * @details 根据底盘目标速度计算各轮目标舵角
    */
   void InverseKinematicsSolution()
   {
-    const float MAX_WHEEL_LINEAR_SPEED = GetMaxWheelLinearSpeed();
-    if (MAX_WHEEL_LINEAR_SPEED <= 1.0e-6f)
+    if (GetMaxWheelLinearSpeed() <= 1.0e-6f)
     {
       for (int i = 0; i < 4; i++)
       {
-        target_speed_[i] = 0.0f;
         target_angle_[i] = 0.0f;
         steer_angle_held_[i] = false;
       }
       return;
     }
-    const float MOTOR_RPM_PER_MPS = motor_max_speed_ / MAX_WHEEL_LINEAR_SPEED;
     switch (chassis_event_)
     {
       case (ChassisMode::RELAX):
         for (int i = 0; i < 4; i++)
         {
-          target_speed_[i] = 0.0f;
           target_angle_[i] = 0.0f;
           steer_angle_held_[i] = false;
         }
@@ -827,7 +818,6 @@ class Helm
       case (ChassisMode::FOLLOW):
       case (ChassisMode::ROTOR):
       {
-        float max_target_speed = 0.0f;
         for (int i = 0; i < 4; i++)
         {
           const WheelPosition WHEEL_POSITION = GetWheelPosition(static_cast<uint8_t>(i));
@@ -844,24 +834,12 @@ class Helm
                   LibXR::CycleValue<float>(motor_steer_feedback_[i].abs_angle - zero_[i]);
               steer_angle_held_[i] = true;
             }
-            target_speed_[i] = 0.0f;
           }
           else
           {
             steer_angle_held_[i] = false;
             /* 沿用原有舵角零位：+y 为 0，正角朝 +x。 */
             target_angle_[i] = static_cast<float>(M_PI_2) - atan2f(WHEEL_VY, WHEEL_VX);
-            target_speed_[i] = WHEEL_VECTOR_SPEED * MOTOR_RPM_PER_MPS;
-            max_target_speed = fmaxf(max_target_speed, target_speed_[i]);
-          }
-        }
-        /* 按最大轮速同比例缩放，保留四轮速度比例并限制至 RPM 上限。 */
-        if (max_target_speed > motor_max_speed_)
-        {
-          const float SPEED_SCALE = motor_max_speed_ / max_target_speed;
-          for (int i = 0; i < 4; i++)
-          {
-            target_speed_[i] *= SPEED_SCALE;
           }
         }
       }
@@ -869,7 +847,6 @@ class Helm
       default:
         for (int i = 0; i < 4; i++)
         {
-          target_speed_[i] = 0.0f;
           target_angle_[i] = 0.0f;
           steer_angle_held_[i] = false;
         }
@@ -900,24 +877,6 @@ class Helm
       {
         motor_reverse_[i] = false;
       }
-    }
-  }
-
-  /**
-   * @brief 舵向误差对应的驱动轮速度补偿
-   */
-  void CompensateWheelSpeed()
-  {
-    /* 最优角确定后按舵向误差抑制轮速，减少转舵时的侧向拖拽。 */
-    for (int i = 0; i < 4; i++)
-    {
-      const LibXR::CycleValue<float> CURRENT_ANGLE(motor_steer_feedback_[i].abs_angle -
-                                                   zero_[i]);
-      const LibXR::CycleValue<float> OPTIMAL_ANGLE(
-          target_angle_[i] + (motor_reverse_[i] ? static_cast<float>(M_PI) : 0.0f));
-      const float STEER_ERROR = OPTIMAL_ANGLE - CURRENT_ANGLE;
-      const float ALIGNMENT = fmaxf(0.0f, cosf(STEER_ERROR));
-      target_speed_[i] *= ALIGNMENT * ALIGNMENT * ALIGNMENT;
     }
   }
 
@@ -1174,8 +1133,7 @@ class Helm
   float current_yaw_ = 0.0f;
   float delta_yaw_ = 0.0f;
 
-  /* 驱动电机转子目标转速 RPM，舵角以 +y 为零位、单位 rad。 */
-  float target_speed_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  /* 目标舵角以 +y 为零位、单位 rad。 */
   LibXR::CycleValue<float> target_angle_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   bool steer_angle_held_[4] = {false, false, false, false};
 
