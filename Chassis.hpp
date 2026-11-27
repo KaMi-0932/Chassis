@@ -7,7 +7,7 @@ depends:
 - id: xrobot-org/BMI088
   ref: same-or-dev
 - id: QDU-Robomaster/RMMotor
-  ref: same-or-dev
+  ref: 投影力矩
 - id: QDU-Robomaster/CMD
   ref: same-or-dev
 - id: QDU-Robomaster/PowerControl
