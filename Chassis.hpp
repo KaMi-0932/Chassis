@@ -7,7 +7,7 @@ depends:
 - id: xrobot-org/BMI088
   ref: same-or-dev
 - id: QDU-Robomaster/RMMotor
-  ref: 投影力矩
+  ref: same-or-dev
 - id: QDU-Robomaster/CMD
   ref: same-or-dev
 - id: QDU-Robomaster/PowerControl
@@ -129,6 +129,10 @@ class Chassis
     ///< First-order low-pass coefficient of the dynamic scale
     float moment_of_inertia =
         0.0f;  ///< Helm yaw inertia (kg*m^2); zero disables yaw feedforward.
+    float friction_compensation_0 = 0.0f;  ///< Mecanum 0 号轮输出轴摩擦补偿力矩 (N*m)
+    float friction_compensation_1 = 0.0f;  ///< Mecanum 1 号轮输出轴摩擦补偿力矩 (N*m)
+    float friction_compensation_2 = 0.0f;  ///< Mecanum 2 号轮输出轴摩擦补偿力矩 (N*m)
+    float friction_compensation_3 = 0.0f;  ///< Mecanum 3 号轮输出轴摩擦补偿力矩 (N*m)
   };
 
   /**
@@ -320,6 +324,13 @@ class Chassis
     if constexpr (std::is_same_v<ChassisType, Helm>)
     {
       result.moment_of_inertia = param.moment_of_inertia;
+    }
+    if constexpr (std::is_same_v<ChassisType, Mecanum>)
+    {
+      result.friction_compensation_0 = param.friction_compensation_0;
+      result.friction_compensation_1 = param.friction_compensation_1;
+      result.friction_compensation_2 = param.friction_compensation_2;
+      result.friction_compensation_3 = param.friction_compensation_3;
     }
     return result;
   }

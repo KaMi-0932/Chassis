@@ -691,7 +691,7 @@ class Helm
     const float G_P_Z = G_IMU_Z;
 
     /* pitch 关节绕 +x，正角抬头。 */
-    const float PITCH_JOINT = GRAVITY_FF_PITCH_SIGN * gravity_pitch_motor_angle_;
+    const float PITCH_JOINT =  GRAVITY_FF_PITCH_SIGN * gravity_pitch_motor_angle_;
     const float CP = cosf(PITCH_JOINT);
     const float SP = sinf(PITCH_JOINT);
     const float G_Y_X = G_P_X;

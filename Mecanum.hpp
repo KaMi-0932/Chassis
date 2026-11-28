@@ -77,6 +77,10 @@ class Mecanum
     ///< High buffer energy threshold (J)
     float rotor_scale_lpf_alpha = 0.2f;  ///< 动态缩放的一阶低通系数
     ///< First-order low-pass coefficient of the dynamic scale
+    float friction_compensation_0 = 0.0f;  ///< 0 号轮输出轴摩擦补偿力矩 (N*m)
+    float friction_compensation_1 = 0.0f;  ///< 1 号轮输出轴摩擦补偿力矩 (N*m)
+    float friction_compensation_2 = 0.0f;  ///< 2 号轮输出轴摩擦补偿力矩 (N*m)
+    float friction_compensation_3 = 0.0f;  ///< 3 号轮输出轴摩擦补偿力矩 (N*m)
   };
 
   /**
@@ -352,6 +356,7 @@ class Mecanum
       mecanum->InverseKinematicsSolution();
       mecanum->DynamicInverseSolution();
       mecanum->GravityFeedforward();
+      mecanum->FrictionCompensation();
       mecanum->CalculateMotorCurrent();
       mecanum->PowerControlUpdate();
       mecanum->mutex_.Unlock();
@@ -560,7 +565,8 @@ class Mecanum
       for (int i = 0; i < 4; i++)
       {
         output_[i] = target_motor_force_[i] * PARAM.wheel_radius +
-                     target_motor_current_[i] + gravity_torque_ff_[i];
+                     target_motor_current_[i] + gravity_torque_ff_[i] +
+                     friction_torque_ff_[i];
       }
     }
   }
@@ -752,8 +758,8 @@ class Mecanum
     const float G_P_Y = G_AHRS_X;
     const float G_P_Z = G_AHRS_Z;
 
-    /* pitch 关节绕 +x，正角抬头。 */
-    const float PITCH_JOINT = GRAVITY_FF_PITCH_SIGN * gravity_pitch_motor_angle_;
+    /* pitch 关节绕 +x，正角抬头；当前反馈角为实际关节角的一半。 */
+    const float PITCH_JOINT = GRAVITY_FF_PITCH_SIGN * 2.0f * gravity_pitch_motor_angle_;
     const float CP = cosf(PITCH_JOINT);
     const float SP = sinf(PITCH_JOINT);
     const float G_Y_X = G_P_X;
@@ -849,6 +855,37 @@ class Mecanum
     gravity_ff_debug_.a_g[0] = 0.0f;
     gravity_ff_debug_.a_g[1] = 0.0f;
     gravity_ff_debug_.tilt_deg = 0.0f;
+  }
+  /**
+   * @brief 按各轮目标方向补偿输出轴摩擦力矩；停车和反向制动时关闭。
+   */
+  void FrictionCompensation()
+  {
+    const float COMPENSATION[4] = {
+        PARAM.friction_compensation_0, PARAM.friction_compensation_1,
+        PARAM.friction_compensation_2, PARAM.friction_compensation_3};
+    for (int i = 0; i < 4; i++)
+    {
+      friction_torque_ff_[i] = 0.0f;
+      if (chassis_event_ == ChassisMode::RELAX || !feedback_valid_ ||
+           COMPENSATION[i] <= 0.0f)
+      {
+        continue;
+      }
+
+      /* 目标和反馈均为减速器输出轴角速度 (rad/s)。 */
+      const float ACTUAL = motor_feedback_[i].omega / PARAM.reduction_ratio;
+      if (std::fabs(target_motor_omega_[i]) <= FRICTION_OMEGA_DEADBAND)
+      {
+        continue;
+      }
+      const float sign = target_motor_omega_[i] > 0.0f ? 1.0f : -1.0f;
+      if (ACTUAL * sign < -FRICTION_OMEGA_DEADBAND)
+      {
+        continue;
+      }
+      friction_torque_ff_[i] = COMPENSATION[i] * sign;
+    }
   }
 
   /**
@@ -1012,6 +1049,7 @@ class Mecanum
   /* +1：yaw 俯视逆时针、pitch 抬头为正，沿用舵轮约定，上车核对。 */
   static constexpr float GRAVITY_FF_YAW_SIGN = 1.0f;
   static constexpr float GRAVITY_FF_PITCH_SIGN = 1.0f;
+  static constexpr float FRICTION_OMEGA_DEADBAND = 0.1f;  ///< 输出轴角速度死区 (rad/s)
 
   struct GravityFeedforwardDebug
   {
@@ -1042,6 +1080,7 @@ class Mecanum
   float target_motor_omega_[4]{0.0f, 0.0f, 0.0f, 0.0f};
   float target_motor_force_[4]{0.0f, 0.0f, 0.0f, 0.0f};
   float target_motor_current_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  float friction_torque_ff_[4]{0.0f, 0.0f, 0.0f, 0.0f};
 
   float output_[4]{0.0f, 0.0f, 0.0f, 0.0f};
 
